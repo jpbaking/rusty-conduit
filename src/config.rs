@@ -1,0 +1,1194 @@
+//! Configuration loading and validation.
+//!
+//! Sources are merged with strict precedence:
+//! **CLI flags > `RUSTY_CONDUIT_*` environment variables > optional `--config` TOML file > defaults**.
+//!
+//! CLI flags and environment variables are both handled by `clap` (each flag declares its
+//! `env` fallback, and `clap` itself prefers the flag over the variable). The resulting
+//! [`CliInput`] is then layered over an optional [`FileConfig`] and the built-in defaults
+//! by [`Config::merge`], and checked by [`Config::validate`].
+
+use std::ffi::OsString;
+use std::fmt;
+use std::fs;
+use std::net::{IpAddr, Ipv4Addr};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use clap::parser::ValueSource;
+use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser};
+use serde::Deserialize;
+
+use crate::logging::{LogFormat, LogLevel};
+
+/// Default bind address.
+pub const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+/// Default HTTP/HTTPS proxy port.
+pub const DEFAULT_HTTP_PORT: u16 = 3128;
+/// Default SOCKS4/5 proxy port.
+pub const DEFAULT_SOCKS_PORT: u16 = 1080;
+/// Default in-memory TTL for generated MITM leaf certificates.
+pub const DEFAULT_MITM_CERT_TTL: Duration = Duration::from_secs(60 * 60);
+/// Smallest accepted MITM leaf certificate TTL.
+pub const MIN_MITM_CERT_TTL: Duration = Duration::from_secs(10);
+/// Default cap on concurrent client connections (`0` = unlimited).
+pub const DEFAULT_MAX_CONNECTIONS: usize = 4096;
+/// Default cap on cached MITM leaf certificates (`0` = unlimited).
+pub const DEFAULT_MITM_CERT_CACHE_MAX_ENTRIES: usize = 10_000;
+
+/// Errors raised while loading or validating configuration. Every variant is `FATAL`.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("failed to read config file {path}: {source}")]
+    ReadFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse config file {path}: {message}")]
+    ParseFile { path: PathBuf, message: String },
+    #[error("invalid value for `{key}` in config file: {message}")]
+    InvalidFileValue { key: &'static str, message: String },
+    #[error("both http_port and socks_port are 0: at least one listener must be enabled")]
+    NoListeners,
+    #[error(
+        "ambiguous MITM CA source: --mitm-ca-p12 cannot be combined with --mitm-ca-cert or --mitm-ca-key"
+    )]
+    AmbiguousCaSource,
+    #[error("incomplete PEM MITM CA: --mitm-ca-cert and --mitm-ca-key must be provided together")]
+    IncompletePemCa,
+    #[error(
+        "conflicting passphrase sources: use only one of --mitm-ca-passphrase and --mitm-ca-passphrase-file"
+    )]
+    ConflictingPassphrase,
+    #[error("--mitm-cert-ttl must be at least 10s (got {})", humantime::format_duration(*.0))]
+    CertTtlTooShort(Duration),
+    #[error("failed to read passphrase file {path}: {source}")]
+    ReadPassphraseFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Raw command-line / environment input (`clap` derive with `env` fallbacks).
+#[derive(Debug, Clone, Default, Parser)]
+#[command(
+    name = "rusty-conduit",
+    version,
+    about = "Lightweight HTTP/HTTPS and SOCKS4/4a/5 proxy server with optional HTTPS MITM inspection",
+    long_about = "Lightweight HTTP/HTTPS and SOCKS4/4a/5 proxy server with optional HTTPS MITM inspection.\n\n\
+                  Precedence: CLI flags > RUSTY_CONDUIT_* environment variables > --config TOML file > defaults."
+)]
+pub struct CliArgs {
+    /// Optional TOML configuration file path
+    #[arg(long, value_name = "PATH", env = "RUSTY_CONDUIT_CONFIG")]
+    pub config: Option<PathBuf>,
+
+    /// IPv4 or IPv6 address to bind listeners to [default: 127.0.0.1]
+    #[arg(long, value_name = "IP", env = "RUSTY_CONDUIT_BIND")]
+    pub bind: Option<IpAddr>,
+
+    /// HTTP/HTTPS proxy port, 0 to disable [default: 3128]
+    #[arg(long, value_name = "PORT", env = "RUSTY_CONDUIT_HTTP_PORT")]
+    pub http_port: Option<u16>,
+
+    /// SOCKS4/5 proxy port, 0 to disable [default: 1080]
+    #[arg(long, value_name = "PORT", env = "RUSTY_CONDUIT_SOCKS_PORT")]
+    pub socks_port: Option<u16>,
+
+    /// Maximum concurrent client connections; excess connections are closed immediately, 0 = unlimited [default: 4096]
+    #[arg(long, value_name = "N", env = "RUSTY_CONDUIT_MAX_CONNECTIONS")]
+    pub max_connections: Option<usize>,
+
+    /// Path to PEM-encoded CA certificate (enables MITM together with --mitm-ca-key)
+    #[arg(long, value_name = "PATH", env = "RUSTY_CONDUIT_MITM_CA_CERT")]
+    pub mitm_ca_cert: Option<PathBuf>,
+
+    /// Path to PEM-encoded CA private key
+    #[arg(long, value_name = "PATH", env = "RUSTY_CONDUIT_MITM_CA_KEY")]
+    pub mitm_ca_key: Option<PathBuf>,
+
+    /// Path to PKCS#12 (.p12/.pfx) CA bundle (enables MITM)
+    #[arg(long, value_name = "PATH", env = "RUSTY_CONDUIT_MITM_CA_P12")]
+    pub mitm_ca_p12: Option<PathBuf>,
+
+    /// Passphrase for the PKCS#12 bundle or encrypted PEM key (prefer the env var or a passphrase file)
+    #[arg(
+        long,
+        value_name = "STR",
+        env = "RUSTY_CONDUIT_MITM_CA_PASSPHRASE",
+        hide_env_values = true
+    )]
+    pub mitm_ca_passphrase: Option<String>,
+
+    /// File containing the CA passphrase (trailing newline is trimmed)
+    #[arg(
+        long,
+        value_name = "PATH",
+        env = "RUSTY_CONDUIT_MITM_CA_PASSPHRASE_FILE"
+    )]
+    pub mitm_ca_passphrase_file: Option<PathBuf>,
+
+    /// In-memory TTL for generated MITM leaf certs, e.g. 30m, 1h, 3600s [default: 1h]
+    #[arg(
+        long,
+        value_name = "DURATION",
+        env = "RUSTY_CONDUIT_MITM_CERT_TTL",
+        value_parser = humantime::parse_duration
+    )]
+    pub mitm_cert_ttl: Option<Duration>,
+
+    /// Maximum cached MITM leaf certificates; expired then oldest entries are evicted, 0 = unlimited [default: 10000]
+    #[arg(
+        long,
+        value_name = "N",
+        env = "RUSTY_CONDUIT_MITM_CERT_CACHE_MAX_ENTRIES"
+    )]
+    pub mitm_cert_cache_max_entries: Option<usize>,
+
+    /// When MITM is ON, reject HTTP/HTTPS traffic over SOCKS4/5
+    #[arg(
+        long,
+        env = "RUSTY_CONDUIT_SOCKS_BLOCK_WEB_IN_MITM",
+        action = ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub socks_block_web_in_mitm: bool,
+
+    /// Log level: QUIET, FATAL, ERROR, INFO, DEBUG, VERBOSE (case-insensitive) [default: INFO]
+    #[arg(long, value_name = "LEVEL", env = "RUSTY_CONDUIT_LOG_LEVEL")]
+    pub log_level: Option<LogLevel>,
+
+    /// Access/SOCKS log format: text (logfmt) or json (NDJSON) [default: text]
+    #[arg(long, value_name = "FMT", env = "RUSTY_CONDUIT_LOG_FORMAT")]
+    pub log_format: Option<LogFormat>,
+
+    /// Optional file path for HTTP/HTTPS access logs
+    #[arg(long, value_name = "PATH", env = "RUSTY_CONDUIT_HTTP_ACCESS_LOG")]
+    pub http_access_log: Option<PathBuf>,
+
+    /// Optional file path for SOCKS4/5 connection logs
+    #[arg(long, value_name = "PATH", env = "RUSTY_CONDUIT_SOCKS_LOG")]
+    pub socks_log: Option<PathBuf>,
+}
+
+/// Parsed CLI/env input plus the provenance details that `clap` alone does not expose.
+#[derive(Debug, Clone, Default)]
+pub struct CliInput {
+    pub args: CliArgs,
+    /// `--mitm-ca-passphrase` came from an actual command-line argument (not the env var).
+    pub passphrase_from_cli: bool,
+    /// `--socks-block-web-in-mitm` was explicitly provided (CLI or env), so it overrides TOML.
+    pub socks_block_web_explicit: bool,
+}
+
+impl CliInput {
+    /// Parse the process arguments and environment; prints help/version or usage errors and exits.
+    pub fn parse() -> Self {
+        let matches = CliArgs::command().get_matches();
+        Self::from_matches(&matches).unwrap_or_else(|e| e.exit())
+    }
+
+    /// Parse an explicit argument list (the environment is still consulted for `env` fallbacks).
+    pub fn try_parse_from<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let matches = CliArgs::command().try_get_matches_from(args)?;
+        Self::from_matches(&matches)
+    }
+
+    fn from_matches(matches: &ArgMatches) -> Result<Self, clap::Error> {
+        let args = CliArgs::from_arg_matches(matches)?;
+        let passphrase_from_cli =
+            matches.value_source("mitm_ca_passphrase") == Some(ValueSource::CommandLine);
+        let socks_block_web_explicit = matches!(
+            matches.value_source("socks_block_web_in_mitm"),
+            Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+        );
+        Ok(Self {
+            args,
+            passphrase_from_cli,
+            socks_block_web_explicit,
+        })
+    }
+}
+
+/// Top-level TOML configuration file layout.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileConfig {
+    pub bind: Option<IpAddr>,
+    pub http_port: Option<u16>,
+    pub socks_port: Option<u16>,
+    pub max_connections: Option<usize>,
+    #[serde(default)]
+    pub mitm: FileMitmConfig,
+    #[serde(default)]
+    pub logging: FileLoggingConfig,
+}
+
+/// `[mitm]` table of the TOML configuration file.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileMitmConfig {
+    pub ca_cert: Option<PathBuf>,
+    pub ca_key: Option<PathBuf>,
+    pub ca_p12: Option<PathBuf>,
+    pub ca_passphrase: Option<String>,
+    pub ca_passphrase_file: Option<PathBuf>,
+    /// Human-readable duration such as `30m`, `1h`, or `3600s`.
+    pub cert_ttl: Option<String>,
+    pub cert_cache_max_entries: Option<usize>,
+    pub socks_block_web: Option<bool>,
+}
+
+/// `[logging]` table of the TOML configuration file.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileLoggingConfig {
+    pub level: Option<String>,
+    pub format: Option<String>,
+    pub http_access_log: Option<PathBuf>,
+    pub socks_log: Option<PathBuf>,
+}
+
+impl FileConfig {
+    /// Parse TOML text.
+    pub fn from_toml_str(text: &str, path: &Path) -> Result<Self, ConfigError> {
+        toml::from_str(text).map_err(|e| ConfigError::ParseFile {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })
+    }
+
+    /// Read and parse a TOML file.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let text = fs::read_to_string(path).map_err(|source| ConfigError::ReadFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Self::from_toml_str(&text, path)
+    }
+}
+
+/// Where the MITM CA comes from (only present when MITM mode is ON).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaSource {
+    Pem { cert: PathBuf, key: PathBuf },
+    Pkcs12 { path: PathBuf },
+}
+
+/// Fully merged configuration.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Config {
+    pub config_path: Option<PathBuf>,
+    pub bind: IpAddr,
+    pub http_port: u16,
+    pub socks_port: u16,
+    /// Maximum concurrent client connections (`0` = unlimited).
+    pub max_connections: usize,
+    pub mitm_ca_cert: Option<PathBuf>,
+    pub mitm_ca_key: Option<PathBuf>,
+    pub mitm_ca_p12: Option<PathBuf>,
+    pub mitm_ca_passphrase: Option<String>,
+    pub mitm_ca_passphrase_file: Option<PathBuf>,
+    pub mitm_cert_ttl: Duration,
+    /// Maximum cached MITM leaf certificates (`0` = unlimited).
+    pub mitm_cert_cache_max_entries: usize,
+    pub socks_block_web_in_mitm: bool,
+    pub log_level: LogLevel,
+    pub log_format: LogFormat,
+    pub http_access_log: Option<PathBuf>,
+    pub socks_log: Option<PathBuf>,
+    /// The passphrase was supplied as a CLI argument (triggers an `INFO` notice).
+    pub passphrase_from_cli: bool,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("config_path", &self.config_path)
+            .field("bind", &self.bind)
+            .field("http_port", &self.http_port)
+            .field("socks_port", &self.socks_port)
+            .field("max_connections", &self.max_connections)
+            .field("mitm_ca_cert", &self.mitm_ca_cert)
+            .field("mitm_ca_key", &self.mitm_ca_key)
+            .field("mitm_ca_p12", &self.mitm_ca_p12)
+            .field(
+                "mitm_ca_passphrase",
+                &self.mitm_ca_passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .field("mitm_ca_passphrase_file", &self.mitm_ca_passphrase_file)
+            .field("mitm_cert_ttl", &self.mitm_cert_ttl)
+            .field(
+                "mitm_cert_cache_max_entries",
+                &self.mitm_cert_cache_max_entries,
+            )
+            .field("socks_block_web_in_mitm", &self.socks_block_web_in_mitm)
+            .field("log_level", &self.log_level)
+            .field("log_format", &self.log_format)
+            .field("http_access_log", &self.http_access_log)
+            .field("socks_log", &self.socks_log)
+            .field("passphrase_from_cli", &self.passphrase_from_cli)
+            .finish()
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            config_path: None,
+            bind: DEFAULT_BIND,
+            http_port: DEFAULT_HTTP_PORT,
+            socks_port: DEFAULT_SOCKS_PORT,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            mitm_ca_cert: None,
+            mitm_ca_key: None,
+            mitm_ca_p12: None,
+            mitm_ca_passphrase: None,
+            mitm_ca_passphrase_file: None,
+            mitm_cert_ttl: DEFAULT_MITM_CERT_TTL,
+            mitm_cert_cache_max_entries: DEFAULT_MITM_CERT_CACHE_MAX_ENTRIES,
+            socks_block_web_in_mitm: false,
+            log_level: LogLevel::Info,
+            log_format: LogFormat::Text,
+            http_access_log: None,
+            socks_log: None,
+            passphrase_from_cli: false,
+        }
+    }
+}
+
+impl Config {
+    /// Load the TOML file named by `--config` (if any) and merge it under the CLI/env input.
+    /// Does not validate; call [`Config::validate`] afterwards.
+    pub fn from_cli(cli: CliInput) -> Result<Self, ConfigError> {
+        let file = match &cli.args.config {
+            Some(path) => Some(FileConfig::load(path)?),
+            None => None,
+        };
+        Self::merge(cli, file)
+    }
+
+    /// Merge CLI/env input over an optional file config over defaults. Does not validate.
+    pub fn merge(cli: CliInput, file: Option<FileConfig>) -> Result<Self, ConfigError> {
+        let file = file.unwrap_or_default();
+        let d = Config::default();
+        let a = cli.args;
+
+        let file_ttl = file
+            .mitm
+            .cert_ttl
+            .as_deref()
+            .map(|s| {
+                humantime::parse_duration(s).map_err(|e| ConfigError::InvalidFileValue {
+                    key: "mitm.cert_ttl",
+                    message: format!("{s:?}: {e}"),
+                })
+            })
+            .transpose()?;
+        let file_level = file
+            .logging
+            .level
+            .as_deref()
+            .map(|s| {
+                s.parse::<LogLevel>()
+                    .map_err(|e| ConfigError::InvalidFileValue {
+                        key: "logging.level",
+                        message: e,
+                    })
+            })
+            .transpose()?;
+        let file_format = file
+            .logging
+            .format
+            .as_deref()
+            .map(|s| {
+                s.parse::<LogFormat>()
+                    .map_err(|e| ConfigError::InvalidFileValue {
+                        key: "logging.format",
+                        message: e,
+                    })
+            })
+            .transpose()?;
+
+        let socks_block_web_in_mitm = if cli.socks_block_web_explicit {
+            a.socks_block_web_in_mitm
+        } else {
+            file.mitm
+                .socks_block_web
+                .unwrap_or(d.socks_block_web_in_mitm)
+        };
+
+        Ok(Config {
+            config_path: a.config,
+            bind: a.bind.or(file.bind).unwrap_or(d.bind),
+            http_port: a.http_port.or(file.http_port).unwrap_or(d.http_port),
+            socks_port: a.socks_port.or(file.socks_port).unwrap_or(d.socks_port),
+            max_connections: a
+                .max_connections
+                .or(file.max_connections)
+                .unwrap_or(d.max_connections),
+            mitm_ca_cert: a.mitm_ca_cert.or(file.mitm.ca_cert),
+            mitm_ca_key: a.mitm_ca_key.or(file.mitm.ca_key),
+            mitm_ca_p12: a.mitm_ca_p12.or(file.mitm.ca_p12),
+            mitm_ca_passphrase: a.mitm_ca_passphrase.or(file.mitm.ca_passphrase),
+            mitm_ca_passphrase_file: a.mitm_ca_passphrase_file.or(file.mitm.ca_passphrase_file),
+            mitm_cert_ttl: a.mitm_cert_ttl.or(file_ttl).unwrap_or(d.mitm_cert_ttl),
+            mitm_cert_cache_max_entries: a
+                .mitm_cert_cache_max_entries
+                .or(file.mitm.cert_cache_max_entries)
+                .unwrap_or(d.mitm_cert_cache_max_entries),
+            socks_block_web_in_mitm,
+            log_level: a.log_level.or(file_level).unwrap_or(d.log_level),
+            log_format: a.log_format.or(file_format).unwrap_or(d.log_format),
+            http_access_log: a.http_access_log.or(file.logging.http_access_log),
+            socks_log: a.socks_log.or(file.logging.socks_log),
+            passphrase_from_cli: cli.passphrase_from_cli,
+        })
+    }
+
+    /// Apply the `FATAL` startup validation rules.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.http_port == 0 && self.socks_port == 0 {
+            return Err(ConfigError::NoListeners);
+        }
+        if self.mitm_ca_p12.is_some() && (self.mitm_ca_cert.is_some() || self.mitm_ca_key.is_some())
+        {
+            return Err(ConfigError::AmbiguousCaSource);
+        }
+        if self.mitm_ca_cert.is_some() != self.mitm_ca_key.is_some() {
+            return Err(ConfigError::IncompletePemCa);
+        }
+        if self.mitm_ca_passphrase.is_some() && self.mitm_ca_passphrase_file.is_some() {
+            return Err(ConfigError::ConflictingPassphrase);
+        }
+        if self.mitm_cert_ttl < MIN_MITM_CERT_TTL {
+            return Err(ConfigError::CertTtlTooShort(self.mitm_cert_ttl));
+        }
+        Ok(())
+    }
+
+    /// The configured MITM CA source, or `None` when MITM mode is OFF.
+    pub fn ca_source(&self) -> Option<CaSource> {
+        match (&self.mitm_ca_p12, &self.mitm_ca_cert, &self.mitm_ca_key) {
+            (Some(path), None, None) => Some(CaSource::Pkcs12 { path: path.clone() }),
+            (None, Some(cert), Some(key)) => Some(CaSource::Pem {
+                cert: cert.clone(),
+                key: key.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether HTTPS MITM inspection is enabled (a complete CA source is configured).
+    pub fn mitm_enabled(&self) -> bool {
+        self.ca_source().is_some()
+    }
+
+    /// Whether both listeners share one port (single-port first-byte multiplexing).
+    pub fn is_multiplexed(&self) -> bool {
+        self.http_port > 0 && self.http_port == self.socks_port
+    }
+
+    /// Whether the bind address is reachable beyond the local host.
+    pub fn is_non_loopback_bind(&self) -> bool {
+        !self.bind.is_loopback()
+    }
+
+    /// `--socks-block-web-in-mitm` is set but has no effect because MITM is OFF.
+    pub fn socks_block_web_inactive(&self) -> bool {
+        self.socks_block_web_in_mitm && !self.mitm_enabled()
+    }
+
+    /// Resolve the CA passphrase from the inline value or the passphrase file
+    /// (trailing `\n` / `\r\n` trimmed).
+    pub fn resolve_passphrase(&self) -> Result<Option<String>, ConfigError> {
+        if let Some(p) = &self.mitm_ca_passphrase {
+            return Ok(Some(p.clone()));
+        }
+        match &self.mitm_ca_passphrase_file {
+            Some(path) => {
+                let text =
+                    fs::read_to_string(path).map_err(|source| ConfigError::ReadPassphraseFile {
+                        path: path.clone(),
+                        source,
+                    })?;
+                let trimmed = text
+                    .strip_suffix("\r\n")
+                    .or_else(|| text.strip_suffix('\n'))
+                    .unwrap_or(&text);
+                Ok(Some(trimmed.to_string()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Startup `INFO` notices (security and configuration hints), in display order.
+    pub fn notices(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.is_non_loopback_bind() {
+            out.push(format!(
+                "SECURITY NOTICE: binding to non-loopback address {}; rusty-conduit v1 has NO \
+                 authentication, so anyone who can reach this address can use the proxy",
+                self.bind
+            ));
+        }
+        if self.passphrase_from_cli {
+            out.push(
+                "NOTICE: --mitm-ca-passphrase was passed on the command line, where it may be \
+                 visible to other users and shell history; prefer RUSTY_CONDUIT_MITM_CA_PASSPHRASE \
+                 or --mitm-ca-passphrase-file"
+                    .to_string(),
+            );
+        }
+        if self.socks_block_web_inactive() {
+            out.push(
+                "NOTICE: --socks-block-web-in-mitm is inactive because MITM is disabled \
+                 (no CA configured)"
+                    .to_string(),
+            );
+        }
+        out
+    }
+
+    /// One-line configuration summary for the startup banner (never includes secrets).
+    pub fn summary(&self) -> String {
+        fn port(p: u16) -> String {
+            if p == 0 {
+                "disabled".to_string()
+            } else {
+                p.to_string()
+            }
+        }
+        fn path(p: &Option<PathBuf>) -> String {
+            p.as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "none".to_string())
+        }
+        fn cap(n: usize) -> String {
+            if n == 0 {
+                "unlimited".to_string()
+            } else {
+                n.to_string()
+            }
+        }
+        let mitm = match self.ca_source() {
+            Some(CaSource::Pem { .. }) => "on(pem)",
+            Some(CaSource::Pkcs12 { .. }) => "on(pkcs12)",
+            None => "off",
+        };
+        format!(
+            "bind={} http_port={} socks_port={} multiplexed={} max_connections={} mitm={} \
+             mitm_cert_ttl={} mitm_cert_cache_max_entries={} socks_block_web_in_mitm={} log_level={} log_format={} http_access_log={} socks_log={} \
+             config={}",
+            self.bind,
+            port(self.http_port),
+            port(self.socks_port),
+            self.is_multiplexed(),
+            cap(self.max_connections),
+            mitm,
+            humantime::format_duration(self.mitm_cert_ttl),
+            cap(self.mitm_cert_cache_max_entries),
+            self.socks_block_web_in_mitm,
+            self.log_level,
+            self.log_format,
+            path(&self.http_access_log),
+            path(&self.socks_log),
+            path(&self.config_path),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes tests that read or mutate process environment variables.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const ENV_VARS: &[&str] = &[
+        "RUSTY_CONDUIT_CONFIG",
+        "RUSTY_CONDUIT_BIND",
+        "RUSTY_CONDUIT_HTTP_PORT",
+        "RUSTY_CONDUIT_SOCKS_PORT",
+        "RUSTY_CONDUIT_MAX_CONNECTIONS",
+        "RUSTY_CONDUIT_MITM_CERT_CACHE_MAX_ENTRIES",
+        "RUSTY_CONDUIT_MITM_CA_CERT",
+        "RUSTY_CONDUIT_MITM_CA_KEY",
+        "RUSTY_CONDUIT_MITM_CA_P12",
+        "RUSTY_CONDUIT_MITM_CA_PASSPHRASE",
+        "RUSTY_CONDUIT_MITM_CA_PASSPHRASE_FILE",
+        "RUSTY_CONDUIT_MITM_CERT_TTL",
+        "RUSTY_CONDUIT_SOCKS_BLOCK_WEB_IN_MITM",
+        "RUSTY_CONDUIT_LOG_LEVEL",
+        "RUSTY_CONDUIT_LOG_FORMAT",
+        "RUSTY_CONDUIT_HTTP_ACCESS_LOG",
+        "RUSTY_CONDUIT_SOCKS_LOG",
+    ];
+
+    /// Holds the env lock and restores a clean `RUSTY_CONDUIT_*` environment on drop.
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn new(vars: &[(&str, &str)]) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            for v in ENV_VARS {
+                std::env::remove_var(v);
+            }
+            for (k, v) in vars {
+                std::env::set_var(k, v);
+            }
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for v in ENV_VARS {
+                std::env::remove_var(v);
+            }
+        }
+    }
+
+    fn temp_file(contents: &str) -> PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "rusty-conduit-config-test-{}-{}.toml",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn cli(args: &[&str]) -> CliInput {
+        let mut full = vec!["rusty-conduit"];
+        full.extend_from_slice(args);
+        CliInput::try_parse_from(full).expect("cli parse")
+    }
+
+    fn load(args: &[&str]) -> Result<Config, ConfigError> {
+        let cfg = Config::from_cli(cli(args))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    #[test]
+    fn defaults_when_nothing_is_set() {
+        let _env = EnvGuard::new(&[]);
+        let cfg = load(&[]).unwrap();
+        assert_eq!(cfg, Config::default());
+        assert_eq!(cfg.bind, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(cfg.http_port, 3128);
+        assert_eq!(cfg.socks_port, 1080);
+        assert_eq!(cfg.mitm_cert_ttl, Duration::from_secs(3600));
+        assert_eq!(cfg.log_level, LogLevel::Info);
+        assert_eq!(cfg.log_format, LogFormat::Text);
+        assert!(!cfg.socks_block_web_in_mitm);
+        assert!(!cfg.mitm_enabled());
+        assert!(!cfg.is_multiplexed());
+        assert!(cfg.notices().is_empty());
+    }
+
+    const FULL_TOML: &str = r#"
+bind = "10.0.0.1"
+http_port = 1111
+socks_port = 2222
+
+[mitm]
+ca_p12 = "/file/ca.p12"
+ca_passphrase_file = "/file/pass"
+cert_ttl = "30m"
+socks_block_web = true
+
+[logging]
+level = "debug"
+format = "json"
+http_access_log = "/file/http.log"
+socks_log = "/file/socks.log"
+"#;
+
+    #[test]
+    fn toml_overrides_defaults() {
+        let _env = EnvGuard::new(&[]);
+        let path = temp_file(FULL_TOML);
+        let cfg = load(&["--config", path.to_str().unwrap()]).unwrap();
+        assert_eq!(cfg.bind, "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(cfg.http_port, 1111);
+        assert_eq!(cfg.socks_port, 2222);
+        assert_eq!(cfg.mitm_ca_p12, Some(PathBuf::from("/file/ca.p12")));
+        assert_eq!(
+            cfg.mitm_ca_passphrase_file,
+            Some(PathBuf::from("/file/pass"))
+        );
+        assert_eq!(cfg.mitm_cert_ttl, Duration::from_secs(1800));
+        assert!(cfg.socks_block_web_in_mitm);
+        assert_eq!(cfg.log_level, LogLevel::Debug);
+        assert_eq!(cfg.log_format, LogFormat::Json);
+        assert_eq!(cfg.http_access_log, Some(PathBuf::from("/file/http.log")));
+        assert_eq!(cfg.socks_log, Some(PathBuf::from("/file/socks.log")));
+        assert_eq!(
+            cfg.ca_source(),
+            Some(CaSource::Pkcs12 {
+                path: PathBuf::from("/file/ca.p12")
+            })
+        );
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn env_overrides_toml() {
+        let path = temp_file(FULL_TOML);
+        let _env = EnvGuard::new(&[
+            ("RUSTY_CONDUIT_CONFIG", path.to_str().unwrap()),
+            ("RUSTY_CONDUIT_BIND", "::1"),
+            ("RUSTY_CONDUIT_HTTP_PORT", "3333"),
+            ("RUSTY_CONDUIT_SOCKS_PORT", "4444"),
+            ("RUSTY_CONDUIT_MITM_CERT_TTL", "2h"),
+            ("RUSTY_CONDUIT_SOCKS_BLOCK_WEB_IN_MITM", "false"),
+            ("RUSTY_CONDUIT_LOG_LEVEL", "VERBOSE"),
+            ("RUSTY_CONDUIT_LOG_FORMAT", "text"),
+            ("RUSTY_CONDUIT_HTTP_ACCESS_LOG", "/env/http.log"),
+            ("RUSTY_CONDUIT_SOCKS_LOG", "/env/socks.log"),
+            ("RUSTY_CONDUIT_MITM_CA_P12", "/env/ca.p12"),
+        ]);
+        let cfg = load(&[]).unwrap();
+        assert_eq!(cfg.config_path, Some(path.clone()));
+        assert_eq!(cfg.bind, "::1".parse::<IpAddr>().unwrap());
+        assert_eq!(cfg.http_port, 3333);
+        assert_eq!(cfg.socks_port, 4444);
+        assert_eq!(cfg.mitm_cert_ttl, Duration::from_secs(7200));
+        assert!(
+            !cfg.socks_block_web_in_mitm,
+            "env false overrides toml true"
+        );
+        assert_eq!(cfg.log_level, LogLevel::Verbose);
+        assert_eq!(cfg.log_format, LogFormat::Text);
+        assert_eq!(cfg.http_access_log, Some(PathBuf::from("/env/http.log")));
+        assert_eq!(cfg.socks_log, Some(PathBuf::from("/env/socks.log")));
+        assert_eq!(cfg.mitm_ca_p12, Some(PathBuf::from("/env/ca.p12")));
+        // Not set in env: falls through to TOML.
+        assert_eq!(
+            cfg.mitm_ca_passphrase_file,
+            Some(PathBuf::from("/file/pass"))
+        );
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn cli_overrides_env_and_toml() {
+        let path = temp_file(FULL_TOML);
+        let _env = EnvGuard::new(&[
+            ("RUSTY_CONDUIT_CONFIG", path.to_str().unwrap()),
+            ("RUSTY_CONDUIT_BIND", "::1"),
+            ("RUSTY_CONDUIT_HTTP_PORT", "3333"),
+            ("RUSTY_CONDUIT_LOG_LEVEL", "VERBOSE"),
+            ("RUSTY_CONDUIT_LOG_FORMAT", "text"),
+            ("RUSTY_CONDUIT_MITM_CERT_TTL", "2h"),
+        ]);
+        let cfg = load(&[
+            "--bind",
+            "127.0.0.2",
+            "--http-port",
+            "5555",
+            "--socks-port",
+            "6666",
+            "--log-level",
+            "error",
+            "--log-format",
+            "JSON",
+            "--mitm-cert-ttl",
+            "3600s",
+            "--http-access-log",
+            "/cli/http.log",
+        ])
+        .unwrap();
+        assert_eq!(cfg.bind, "127.0.0.2".parse::<IpAddr>().unwrap());
+        assert_eq!(cfg.http_port, 5555);
+        assert_eq!(cfg.socks_port, 6666);
+        assert_eq!(cfg.log_level, LogLevel::Error);
+        assert_eq!(cfg.log_format, LogFormat::Json);
+        assert_eq!(cfg.mitm_cert_ttl, Duration::from_secs(3600));
+        assert_eq!(cfg.http_access_log, Some(PathBuf::from("/cli/http.log")));
+        // Not on CLI or env: from TOML.
+        assert_eq!(cfg.socks_log, Some(PathBuf::from("/file/socks.log")));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn cli_config_path_overrides_env_config_path() {
+        let env_path = temp_file("http_port = 1\n");
+        let cli_path = temp_file("http_port = 2\n");
+        let _env = EnvGuard::new(&[("RUSTY_CONDUIT_CONFIG", env_path.to_str().unwrap())]);
+        let cfg = load(&["--config", cli_path.to_str().unwrap()]).unwrap();
+        assert_eq!(cfg.http_port, 2);
+        fs::remove_file(env_path).ok();
+        fs::remove_file(cli_path).ok();
+    }
+
+    #[test]
+    fn socks_block_web_flag_and_env() {
+        let _env = EnvGuard::new(&[("RUSTY_CONDUIT_SOCKS_BLOCK_WEB_IN_MITM", "true")]);
+        let c = cli(&[]);
+        assert!(c.socks_block_web_explicit);
+        assert!(Config::merge(c, None).unwrap().socks_block_web_in_mitm);
+        drop(_env);
+
+        let _env = EnvGuard::new(&[]);
+        let c = cli(&["--socks-block-web-in-mitm"]);
+        assert!(c.socks_block_web_explicit);
+        assert!(Config::merge(c, None).unwrap().socks_block_web_in_mitm);
+
+        let c = cli(&[]);
+        assert!(!c.socks_block_web_explicit);
+        let file = FileConfig {
+            mitm: FileMitmConfig {
+                socks_block_web: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            Config::merge(c, Some(file))
+                .unwrap()
+                .socks_block_web_in_mitm
+        );
+    }
+
+    #[test]
+    fn passphrase_provenance() {
+        let _env = EnvGuard::new(&[]);
+        let cfg = Config::merge(cli(&["--mitm-ca-passphrase", "s3cret"]), None).unwrap();
+        assert!(cfg.passphrase_from_cli);
+        assert_eq!(cfg.mitm_ca_passphrase.as_deref(), Some("s3cret"));
+        assert!(cfg
+            .notices()
+            .iter()
+            .any(|n| n.contains("--mitm-ca-passphrase")));
+        assert!(!format!("{cfg:?}").contains("s3cret"), "Debug must redact");
+        drop(_env);
+
+        let _env = EnvGuard::new(&[("RUSTY_CONDUIT_MITM_CA_PASSPHRASE", "s3cret")]);
+        let cfg = Config::merge(cli(&[]), None).unwrap();
+        assert!(!cfg.passphrase_from_cli);
+        assert_eq!(cfg.mitm_ca_passphrase.as_deref(), Some("s3cret"));
+        assert!(cfg.notices().is_empty());
+    }
+
+    #[test]
+    fn passphrase_file_trims_trailing_newline() {
+        let path = temp_file("hunter2\n");
+        let cfg = Config {
+            mitm_ca_passphrase_file: Some(path.clone()),
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.resolve_passphrase().unwrap().as_deref(),
+            Some("hunter2")
+        );
+        fs::write(&path, "hunter2\r\n").unwrap();
+        assert_eq!(
+            cfg.resolve_passphrase().unwrap().as_deref(),
+            Some("hunter2")
+        );
+        fs::write(&path, "with space ").unwrap();
+        assert_eq!(
+            cfg.resolve_passphrase().unwrap().as_deref(),
+            Some("with space ")
+        );
+        fs::remove_file(path).ok();
+    }
+
+    // ---- FATAL validation rules ----
+
+    #[test]
+    fn fatal_both_ports_disabled() {
+        let _env = EnvGuard::new(&[]);
+        let err = load(&["--http-port", "0", "--socks-port", "0"]).unwrap_err();
+        assert!(matches!(err, ConfigError::NoListeners));
+        // Disabling only one is fine.
+        load(&["--http-port", "0"]).unwrap();
+        load(&["--socks-port", "0"]).unwrap();
+    }
+
+    #[test]
+    fn fatal_p12_combined_with_pem() {
+        let _env = EnvGuard::new(&[]);
+        let err = load(&["--mitm-ca-p12", "a.p12", "--mitm-ca-cert", "c.pem"]).unwrap_err();
+        assert!(matches!(err, ConfigError::AmbiguousCaSource));
+        let err = load(&["--mitm-ca-p12", "a.p12", "--mitm-ca-key", "k.pem"]).unwrap_err();
+        assert!(matches!(err, ConfigError::AmbiguousCaSource));
+        let err = load(&[
+            "--mitm-ca-p12",
+            "a.p12",
+            "--mitm-ca-cert",
+            "c.pem",
+            "--mitm-ca-key",
+            "k.pem",
+        ])
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::AmbiguousCaSource));
+    }
+
+    #[test]
+    fn fatal_ambiguous_ca_across_sources() {
+        let path = temp_file("[mitm]\nca_cert = \"c.pem\"\nca_key = \"k.pem\"\n");
+        let _env = EnvGuard::new(&[("RUSTY_CONDUIT_MITM_CA_P12", "a.p12")]);
+        let err = load(&["--config", path.to_str().unwrap()]).unwrap_err();
+        assert!(matches!(err, ConfigError::AmbiguousCaSource));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn fatal_incomplete_pem_pair() {
+        let _env = EnvGuard::new(&[]);
+        let err = load(&["--mitm-ca-cert", "c.pem"]).unwrap_err();
+        assert!(matches!(err, ConfigError::IncompletePemCa));
+        let err = load(&["--mitm-ca-key", "k.pem"]).unwrap_err();
+        assert!(matches!(err, ConfigError::IncompletePemCa));
+        let cfg = load(&["--mitm-ca-cert", "c.pem", "--mitm-ca-key", "k.pem"]).unwrap();
+        assert!(cfg.mitm_enabled());
+        assert_eq!(
+            cfg.ca_source(),
+            Some(CaSource::Pem {
+                cert: "c.pem".into(),
+                key: "k.pem".into()
+            })
+        );
+    }
+
+    #[test]
+    fn fatal_both_passphrase_sources() {
+        let _env = EnvGuard::new(&[("RUSTY_CONDUIT_MITM_CA_PASSPHRASE_FILE", "/pass")]);
+        let err = load(&["--mitm-ca-passphrase", "x"]).unwrap_err();
+        assert!(matches!(err, ConfigError::ConflictingPassphrase));
+    }
+
+    #[test]
+    fn fatal_cert_ttl_below_10s() {
+        let _env = EnvGuard::new(&[]);
+        let err = load(&["--mitm-cert-ttl", "9s"]).unwrap_err();
+        assert!(matches!(err, ConfigError::CertTtlTooShort(d) if d == Duration::from_secs(9)));
+        let err = load(&["--mitm-cert-ttl", "9999ms"]).unwrap_err();
+        assert!(matches!(err, ConfigError::CertTtlTooShort(_)));
+        let cfg = load(&["--mitm-cert-ttl", "10s"]).unwrap();
+        assert_eq!(cfg.mitm_cert_ttl, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn fatal_cert_ttl_below_10s_from_toml() {
+        let path = temp_file("[mitm]\ncert_ttl = \"5s\"\n");
+        let _env = EnvGuard::new(&[]);
+        let err = load(&["--config", path.to_str().unwrap()]).unwrap_err();
+        assert!(matches!(err, ConfigError::CertTtlTooShort(_)));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn fatal_bad_config_file() {
+        let _env = EnvGuard::new(&[]);
+        let err = load(&["--config", "/definitely/not/here.toml"]).unwrap_err();
+        assert!(matches!(err, ConfigError::ReadFile { .. }));
+
+        let path = temp_file("unknown_key = 1\n");
+        let err = load(&["--config", path.to_str().unwrap()]).unwrap_err();
+        assert!(matches!(err, ConfigError::ParseFile { .. }));
+        fs::remove_file(path).ok();
+
+        let path = temp_file("[logging]\nlevel = \"loud\"\n");
+        let err = load(&["--config", path.to_str().unwrap()]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidFileValue {
+                key: "logging.level",
+                ..
+            }
+        ));
+        fs::remove_file(path).ok();
+
+        let path = temp_file("[mitm]\ncert_ttl = \"forever\"\n");
+        let err = load(&["--config", path.to_str().unwrap()]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidFileValue {
+                key: "mitm.cert_ttl",
+                ..
+            }
+        ));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn invalid_cli_values_are_rejected() {
+        let _env = EnvGuard::new(&[]);
+        for args in [
+            &["rusty-conduit", "--log-level", "loud"][..],
+            &["rusty-conduit", "--log-format", "xml"][..],
+            &["rusty-conduit", "--bind", "not-an-ip"][..],
+            &["rusty-conduit", "--http-port", "70000"][..],
+            &["rusty-conduit", "--mitm-cert-ttl", "soon"][..],
+        ] {
+            assert!(CliInput::try_parse_from(args).is_err(), "{args:?}");
+        }
+    }
+
+    // ---- INFO notices ----
+
+    #[test]
+    fn notice_non_loopback_bind() {
+        let _env = EnvGuard::new(&[]);
+        for bind in ["0.0.0.0", "192.168.1.10", "::"] {
+            let cfg = load(&["--bind", bind]).unwrap();
+            assert!(cfg.is_non_loopback_bind(), "{bind}");
+            assert!(cfg.notices()[0].contains("NO authentication"), "{bind}");
+        }
+        for bind in ["127.0.0.1", "::1"] {
+            let cfg = load(&["--bind", bind]).unwrap();
+            assert!(!cfg.is_non_loopback_bind(), "{bind}");
+            assert!(cfg.notices().is_empty(), "{bind}");
+        }
+    }
+
+    #[test]
+    fn notice_socks_block_web_without_mitm() {
+        let _env = EnvGuard::new(&[]);
+        let cfg = load(&["--socks-block-web-in-mitm"]).unwrap();
+        assert!(cfg.socks_block_web_inactive());
+        assert!(cfg.notices().iter().any(|n| n.contains("inactive")));
+
+        let cfg = load(&["--socks-block-web-in-mitm", "--mitm-ca-p12", "a.p12"]).unwrap();
+        assert!(!cfg.socks_block_web_inactive());
+        assert!(cfg.notices().is_empty());
+    }
+
+    #[test]
+    fn multiplexed_when_ports_equal() {
+        let _env = EnvGuard::new(&[]);
+        let cfg = load(&["--http-port", "8080", "--socks-port", "8080"]).unwrap();
+        assert!(cfg.is_multiplexed());
+        assert!(cfg.summary().contains("multiplexed=true"));
+    }
+
+    // ---- Resource caps ----
+
+    const CAPS_TOML: &str = "max_connections = 11\n[mitm]\ncert_cache_max_entries = 22\n";
+
+    #[test]
+    fn caps_defaults() {
+        let _env = EnvGuard::new(&[]);
+        let cfg = load(&[]).unwrap();
+        assert_eq!(cfg.max_connections, 4096);
+        assert_eq!(cfg.mitm_cert_cache_max_entries, 10_000);
+        let s = cfg.summary();
+        assert!(s.contains("max_connections=4096"), "{s}");
+        assert!(s.contains("mitm_cert_cache_max_entries=10000"), "{s}");
+    }
+
+    #[test]
+    fn caps_from_toml() {
+        let path = temp_file(CAPS_TOML);
+        let _env = EnvGuard::new(&[]);
+        let cfg = load(&["--config", path.to_str().unwrap()]).unwrap();
+        assert_eq!(cfg.max_connections, 11);
+        assert_eq!(cfg.mitm_cert_cache_max_entries, 22);
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn caps_env_overrides_toml() {
+        let path = temp_file(CAPS_TOML);
+        let _env = EnvGuard::new(&[
+            ("RUSTY_CONDUIT_MAX_CONNECTIONS", "33"),
+            ("RUSTY_CONDUIT_MITM_CERT_CACHE_MAX_ENTRIES", "44"),
+        ]);
+        let cfg = load(&["--config", path.to_str().unwrap()]).unwrap();
+        assert_eq!(cfg.max_connections, 33);
+        assert_eq!(cfg.mitm_cert_cache_max_entries, 44);
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn caps_cli_overrides_env_and_toml() {
+        let path = temp_file(CAPS_TOML);
+        let _env = EnvGuard::new(&[
+            ("RUSTY_CONDUIT_MAX_CONNECTIONS", "33"),
+            ("RUSTY_CONDUIT_MITM_CERT_CACHE_MAX_ENTRIES", "44"),
+        ]);
+        let cfg = load(&[
+            "--config",
+            path.to_str().unwrap(),
+            "--max-connections",
+            "55",
+            "--mitm-cert-cache-max-entries",
+            "66",
+        ])
+        .unwrap();
+        assert_eq!(cfg.max_connections, 55);
+        assert_eq!(cfg.mitm_cert_cache_max_entries, 66);
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn caps_zero_means_unlimited_at_every_layer() {
+        let path = temp_file("max_connections = 0\n[mitm]\ncert_cache_max_entries = 0\n");
+        let _env = EnvGuard::new(&[]);
+        let cfg = load(&["--config", path.to_str().unwrap()]).unwrap();
+        assert_eq!(cfg.max_connections, 0);
+        assert_eq!(cfg.mitm_cert_cache_max_entries, 0);
+        let s = cfg.summary();
+        assert!(s.contains("max_connections=unlimited"), "{s}");
+        assert!(s.contains("mitm_cert_cache_max_entries=unlimited"), "{s}");
+        fs::remove_file(path).ok();
+        drop(_env);
+
+        // An explicit CLI 0 beats a non-zero env value rather than falling through.
+        let _env = EnvGuard::new(&[
+            ("RUSTY_CONDUIT_MAX_CONNECTIONS", "33"),
+            ("RUSTY_CONDUIT_MITM_CERT_CACHE_MAX_ENTRIES", "44"),
+        ]);
+        let cfg = load(&[
+            "--max-connections",
+            "0",
+            "--mitm-cert-cache-max-entries",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(cfg.max_connections, 0);
+        assert_eq!(cfg.mitm_cert_cache_max_entries, 0);
+    }
+
+    #[test]
+    fn caps_reject_invalid_values() {
+        let _env = EnvGuard::new(&[]);
+        for args in [
+            &["rusty-conduit", "--max-connections", "-1"][..],
+            &["rusty-conduit", "--max-connections", "many"][..],
+            &["rusty-conduit", "--mitm-cert-cache-max-entries", "-1"][..],
+            &["rusty-conduit", "--mitm-cert-cache-max-entries", "many"][..],
+        ] {
+            assert!(CliInput::try_parse_from(args).is_err(), "{args:?}");
+        }
+        let path = temp_file("max_connections = -1\n");
+        let err = load(&["--config", path.to_str().unwrap()]).unwrap_err();
+        assert!(matches!(err, ConfigError::ParseFile { .. }), "{err}");
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn summary_never_contains_passphrase() {
+        let _env = EnvGuard::new(&[]);
+        let cfg = load(&["--mitm-ca-p12", "a.p12", "--mitm-ca-passphrase", "s3cret"]).unwrap();
+        let s = cfg.summary();
+        assert!(s.contains("mitm=on(pkcs12)"));
+        assert!(!s.contains("s3cret"));
+    }
+}
