@@ -21,9 +21,13 @@
 
 ### 1. Download or install
 
-Download a prebuilt package for Linux, macOS, or Windows (`amd64` / `arm64`) from **[Releases](https://github.com/jpbaking/rusty-conduit/releases)**, or build from source with Rust:
+Download a prebuilt package for Linux, macOS, or Windows (`amd64` / `arm64`) from **[Releases](https://github.com/jpbaking/rusty-conduit/releases)**, run with Docker, or build from source with Rust:
 
 ```sh
+# Docker (multi-arch: linux/amd64, linux/arm64; binds 0.0.0.0 inside container)
+docker run --rm -p 127.0.0.1:3128:3128 -p 127.0.0.1:1080:1080 ghcr.io/jpbaking/rusty-conduit:latest
+
+# Or build from source
 cargo install --path .
 ```
 

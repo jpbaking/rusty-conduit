@@ -19,7 +19,28 @@ Grab the archive for your OS and CPU architecture from the [GitHub Releases](htt
 
 Extract it and place `rusty-conduit` (or `rusty-conduit.exe`) somewhere on your `PATH`.
 
-### Option B: Build from source
+### Option B: Run with Docker
+
+Multi-arch images (`linux/amd64` and `linux/arm64`, based on Ubuntu 26.04 LTS) are published to GitHub Container Registry on each release:
+
+```sh
+# Publish to host loopback only (recommended — v1 has no proxy authentication)
+docker run --rm \
+  -p 127.0.0.1:3128:3128 \
+  -p 127.0.0.1:1080:1080 \
+  ghcr.io/jpbaking/rusty-conduit:latest
+```
+
+Inside the container, `RUSTY_CONDUIT_BIND` defaults to `0.0.0.0` and the process runs as a non-root user (`rusty-conduit`, UID `10001`). Any CLI flags or `RUSTY_CONDUIT_*` environment variables work as usual:
+
+```sh
+docker run --rm \
+  -p 127.0.0.1:8888:8888 \
+  ghcr.io/jpbaking/rusty-conduit:latest \
+  --http-port 8888 --socks-port 8888 --log-level DEBUG
+```
+
+### Option C: Build from source
 
 Requires a stable Rust toolchain (<https://rustup.rs>):
 
