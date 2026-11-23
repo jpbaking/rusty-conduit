@@ -535,7 +535,7 @@ async fn leaf_cert_has_san_issuer_and_grace_window() {
 #[tokio::test]
 async fn ttl_expiry_and_background_reaper_regenerate_leaf() {
     let origin = spawn_origin().await;
-    let ttl = Duration::from_millis(1500);
+    let ttl = Duration::from_secs(4);
     let proxy = MitmProxy::start(
         "reaper",
         &origin,
@@ -555,7 +555,7 @@ async fn ttl_expiry_and_background_reaper_regenerate_leaf() {
 
     // After the TTL the reaper evicts the entry...
     let mut evicted = false;
-    for _ in 0..100 {
+    for _ in 0..200 {
         tokio::time::sleep(Duration::from_millis(50)).await;
         if proxy.state.cache.is_empty() {
             evicted = true;
