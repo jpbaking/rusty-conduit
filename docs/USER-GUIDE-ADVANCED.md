@@ -26,6 +26,8 @@ Settings are merged in strict order (higher overrides lower):
 | `--http-port <PORT>` | `RUSTY_CONDUIT_HTTP_PORT` | `http_port` | `3128` | HTTP/HTTPS proxy port (`0` disables) |
 | `--socks-port <PORT>` | `RUSTY_CONDUIT_SOCKS_PORT` | `socks_port` | `1080` | SOCKS4/4a/5 proxy port (`0` disables) |
 | `--max-connections <N>` | `RUSTY_CONDUIT_MAX_CONNECTIONS` | `max_connections` | `4096` | Max concurrent connections across all listeners (`0` = unlimited) |
+| `--allow <RULE>` | `RUSTY_CONDUIT_ALLOW` | `allow` | *(none)* | Destination allowlist (IP, CIDR, FQDN, or `*.domain`); mutually exclusive with `--block` |
+| `--block <RULE>` | `RUSTY_CONDUIT_BLOCK` | `block` | *(none)* | Destination blocklist (IP, CIDR, FQDN, or `*.domain`); mutually exclusive with `--allow` |
 | `--mitm-ca-cert <PATH>` | `RUSTY_CONDUIT_MITM_CA_CERT` | `mitm.ca_cert` | *(none)* | PEM CA certificate (enables MITM with `--mitm-ca-key`) |
 | `--mitm-ca-key <PATH>` | `RUSTY_CONDUIT_MITM_CA_KEY` | `mitm.ca_key` | *(none)* | PEM CA private key (PKCS#8, PKCS#1 RSA, SEC1 EC, or encrypted PKCS#8) |
 | `--mitm-ca-p12 <PATH>` | `RUSTY_CONDUIT_MITM_CA_P12` | `mitm.ca_p12` | *(none)* | PKCS#12 (`.p12`/`.pfx`) CA bundle (enables MITM) |
@@ -47,6 +49,9 @@ bind = "127.0.0.1"
 http_port = 3128
 socks_port = 1080
 max_connections = 4096
+# Optional destination filter — set EITHER `allow` OR `block`, never both:
+# block = ["127.0.0.0/8", "::1", "10.0.0.0/8", "*.internal"]
+# allow = ["example.com", "*.example.org", "203.0.113.0/24"]
 
 [mitm]
 # Use EITHER a PEM pair...
@@ -78,6 +83,7 @@ rusty-conduit --config /etc/rusty-conduit/rusty-conduit.toml --http-port 8080
 
 **Fatal startup errors (exit code `1`):**
 - Both `http_port` and `socks_port` are `0`.
+- Supplying both `--allow` and `--block` (including across CLI/env and TOML).
 - Mixing `--mitm-ca-p12` with `--mitm-ca-cert` or `--mitm-ca-key`.
 - Supplying only one of `--mitm-ca-cert` or `--mitm-ca-key`.
 - Supplying both `--mitm-ca-passphrase` and `--mitm-ca-passphrase-file`.
@@ -185,7 +191,7 @@ rusty-conduit --log-level DEBUG --log-format json 2>/dev/null \
 ### Field Reference
 
 - **HTTP (`kind=http`):** `ts`, `client`, `proto` (`http`|`https`), `mitm` (`true`|`false`), `method`, `target`, `status`, `bytes_in`, `bytes_out`, `duration_ms`.
-- **SOCKS (`kind=socks`):** `ts`, `client`, `proto` (`socks4`|`socks4a`|`socks5`), `cmd`, `target`, `status` (`ok`, `blocked_web_in_mitm`, `command_not_supported`, `address_type_not_supported`, `no_acceptable_auth`, `connection_refused`, `host_unreachable`, `network_unreachable`, `general_failure`), `bytes_in`, `bytes_out`, `duration_ms`.
+- **SOCKS (`kind=socks`):** `ts`, `client`, `proto` (`socks4`|`socks4a`|`socks5`), `cmd`, `target`, `status` (`ok`, `not_allowed`, `blocked_web_in_mitm`, `command_not_supported`, `address_type_not_supported`, `no_acceptable_auth`, `connection_refused`, `host_unreachable`, `network_unreachable`, `general_failure`), `bytes_in`, `bytes_out`, `duration_ms`.
 
 ---
 

@@ -37,6 +37,7 @@ use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::filter::HostFilter;
 use crate::logging::{AccessLogger, HttpAccessRecord, Logger};
 use crate::net::DEFAULT_CONNECT_TIMEOUT;
 use crate::server::{Connection, HandlerFuture};
@@ -127,6 +128,7 @@ pub struct HttpProxy {
     logger: Logger,
     connect_timeout: Duration,
     mitm: Option<Arc<dyn MitmHandler>>,
+    pub(crate) filter: Option<Arc<HostFilter>>,
 }
 
 impl fmt::Debug for HttpProxy {
@@ -134,6 +136,7 @@ impl fmt::Debug for HttpProxy {
         f.debug_struct("HttpProxy")
             .field("connect_timeout", &self.connect_timeout)
             .field("mitm", &self.mitm.is_some())
+            .field("filter", &self.filter.as_ref().map(|f| f.mode_str()))
             .finish_non_exhaustive()
     }
 }
@@ -145,7 +148,14 @@ impl HttpProxy {
             logger,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             mitm: None,
+            filter: None,
         }
+    }
+
+    /// Enforce a destination allowlist or blocklist on every upstream dial.
+    pub fn with_filter(mut self, filter: Arc<HostFilter>) -> Self {
+        self.filter = Some(filter);
+        self
     }
 
     /// Route every `CONNECT` through `handler` instead of the opaque tunnel.
@@ -425,9 +435,12 @@ fn empty_body() -> ProxyBody {
     Empty::new().map_err(|never| match never {}).boxed()
 }
 
-/// Map an upstream dial error to the proxy status code (`504` on timeout, else `502`).
+/// Map an upstream dial error to the proxy status code (`403` when filtered, `504` on timeout,
+/// else `502`).
 pub(crate) fn dial_error_status(e: &std::io::Error) -> StatusCode {
-    if e.kind() == std::io::ErrorKind::TimedOut {
+    if crate::filter::is_access_denied(e) {
+        StatusCode::FORBIDDEN
+    } else if e.kind() == std::io::ErrorKind::TimedOut {
         StatusCode::GATEWAY_TIMEOUT
     } else {
         StatusCode::BAD_GATEWAY

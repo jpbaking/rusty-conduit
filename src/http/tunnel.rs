@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use super::{
     connect_established, dial_error_status, error_response, ConnectTarget, ProxyBody, RequestCtx,
 };
-use crate::net::{connect_upstream, relay_bidirectional};
+use crate::net::{connect_upstream_filtered, relay_bidirectional};
 
 /// Handle a `CONNECT` request without interception.
 pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response<ProxyBody> {
@@ -40,16 +40,22 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
         return error_response(StatusCode::BAD_REQUEST, "CONNECT target must be host:port");
     };
 
-    let mut upstream =
-        match connect_upstream(&target.host, target.port, ctx.proxy.connect_timeout).await {
-            Ok(s) => s,
-            Err(e) => {
-                let status = dial_error_status(&e);
-                guard.set_status(status);
-                logger.error(format!("CONNECT upstream {target} failed: {e}"));
-                return error_response(status, "upstream connection failed");
-            }
-        };
+    let mut upstream = match connect_upstream_filtered(
+        &target.host,
+        target.port,
+        ctx.proxy.connect_timeout,
+        ctx.proxy.filter.as_deref(),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            let status = dial_error_status(&e);
+            guard.set_status(status);
+            logger.error(format!("CONNECT upstream {target} failed: {e}"));
+            return error_response(status, "upstream connection failed");
+        }
+    };
 
     guard.set_status(StatusCode::OK);
     let shutdown = ctx.shutdown.clone();

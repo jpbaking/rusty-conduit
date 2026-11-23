@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use super::{Failure, Session, SocksProxy, SocksTarget, TargetHost, MAX_CSTRING_LEN};
-use crate::net::connect_upstream;
+use crate::net::connect_upstream_filtered;
 use crate::server::Connection;
 
 pub const VERSION: u8 = 0x04;
@@ -146,7 +146,12 @@ pub(super) async fn serve(proxy: &SocksProxy, mut conn: Connection) {
     }
 
     let dial_host = req.target.dial_host();
-    let dial = connect_upstream(&dial_host, req.target.port, proxy.connect_timeout);
+    let dial = connect_upstream_filtered(
+        &dial_host,
+        req.target.port,
+        proxy.connect_timeout,
+        proxy.filter.as_deref(),
+    );
     let upstream = tokio::select! {
         () = conn.shutdown.cancelled() => return,
         res = dial => res,

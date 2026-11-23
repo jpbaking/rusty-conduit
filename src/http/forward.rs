@@ -16,7 +16,7 @@ use hyper::{Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::TokioIo;
 
 use super::{dial_error_status, error_response, CountingBody, ProxyBody, RequestCtx};
-use crate::net::connect_upstream;
+use crate::net::connect_upstream_filtered;
 
 /// Fixed hop-by-hop headers removed in both directions (RFC 9110 §7.6.1 plus the legacy
 /// `Proxy-Connection`, `Keep-Alive`, and `Upgrade`, which plain forwarding does not support).
@@ -133,7 +133,13 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
     }
     let upstream_req = Request::from_parts(parts, CountingBody::new(body, guard.bytes_in(), None));
 
-    let stream = match connect_upstream(&target.host, target.port, ctx.proxy.connect_timeout).await
+    let stream = match connect_upstream_filtered(
+        &target.host,
+        target.port,
+        ctx.proxy.connect_timeout,
+        ctx.proxy.filter.as_deref(),
+    )
+    .await
     {
         Ok(s) => s,
         Err(e) => {

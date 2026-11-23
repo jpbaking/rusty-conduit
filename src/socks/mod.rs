@@ -39,6 +39,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::filter::HostFilter;
 use crate::http::tunnel::CountingStream;
 use crate::logging::{AccessLogger, Logger, SocksLogRecord};
 use crate::mux::{self, DetectedProtocol};
@@ -107,6 +108,7 @@ pub trait RelayGuard: Send + Sync + 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Failure {
     General,
+    NotAllowed,
     NetworkUnreachable,
     HostUnreachable,
     ConnectionRefused,
@@ -117,6 +119,9 @@ pub enum Failure {
 impl Failure {
     /// Classify an upstream dial error.
     pub fn from_dial_error(e: &io::Error) -> Self {
+        if crate::filter::is_access_denied(e) {
+            return Self::NotAllowed;
+        }
         match e.kind() {
             io::ErrorKind::ConnectionRefused => Self::ConnectionRefused,
             io::ErrorKind::TimedOut | io::ErrorKind::HostUnreachable => Self::HostUnreachable,
@@ -129,6 +134,7 @@ impl Failure {
     pub fn socks5_reply(self) -> u8 {
         match self {
             Self::General => 0x01,
+            Self::NotAllowed => 0x02,
             Self::NetworkUnreachable => 0x03,
             Self::HostUnreachable => 0x04,
             Self::ConnectionRefused => 0x05,
@@ -141,6 +147,7 @@ impl Failure {
     pub fn label(self) -> &'static str {
         match self {
             Self::General => "general_failure",
+            Self::NotAllowed => "not_allowed",
             Self::NetworkUnreachable => "network_unreachable",
             Self::HostUnreachable => "host_unreachable",
             Self::ConnectionRefused => "connection_refused",
@@ -158,6 +165,7 @@ pub struct SocksProxy {
     pub(crate) connect_timeout: Duration,
     pub(crate) handshake_timeout: Duration,
     pub(crate) guard: Option<Arc<dyn RelayGuard>>,
+    pub(crate) filter: Option<Arc<HostFilter>>,
 }
 
 impl fmt::Debug for SocksProxy {
@@ -166,6 +174,7 @@ impl fmt::Debug for SocksProxy {
             .field("connect_timeout", &self.connect_timeout)
             .field("handshake_timeout", &self.handshake_timeout)
             .field("guard", &self.guard.is_some())
+            .field("filter", &self.filter.as_ref().map(|f| f.mode_str()))
             .finish_non_exhaustive()
     }
 }
@@ -178,7 +187,14 @@ impl SocksProxy {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             guard: None,
+            filter: None,
         }
+    }
+
+    /// Enforce a destination allowlist or blocklist on every upstream dial.
+    pub fn with_filter(mut self, filter: Arc<HostFilter>) -> Self {
+        self.filter = Some(filter);
+        self
     }
 
     /// Install a first-chunk relay guard (used by `--socks-block-web-in-mitm`).

@@ -13,6 +13,7 @@
 - **Strictly zero caching:** Never caches HTTP responses, DNS lookups, or upstream connections, and streams bodies without full buffering. The **only** in-memory cache is for dynamically signed MITM leaf certificates — strictly bounded by TTL and max-entry caps.
 - **Pure-Rust TLS, zero OpenSSL:** Built on `rustls` + `ring`, `rcgen`, and `p12-keystore`. Identical single-binary builds on **Linux, macOS (Apple Silicon & Intel), and Windows (`amd64` & `arm64`)**.
 - **Opt-in HTTPS MITM without surprises:** OFF by default and **never auto-generates a CA**. Bring your own PEM or PKCS#12 CA, inspect HTTP/1.1 & HTTP/2 traffic, and optionally block web traffic over SOCKS (`--socks-block-web-in-mitm`).
+- **Destination allowlist / blocklist:** Restrict egress with `--allow` or `--block` (IP, CIDR, exact FQDN, or `*.domain` wildcards), checking both hostnames and resolved IPs before connecting.
 - **Built for operators:** `CLI > env > TOML` configuration, 6 diagnostic log levels, structured `text` (logfmt) or `json` (NDJSON) access/SOCKS logs, graceful shutdown draining, and built-in connection & cert-cache caps (~6 MB idle RSS).
 
 ---

@@ -53,9 +53,10 @@ use super::{
     dial_error_status, error_response, AccessGuard, ConnectTarget, CountingBody, MitmConnect,
     MitmHandler, ProxyBody,
 };
+use crate::filter::HostFilter;
 use crate::logging::{AccessLogger, HttpAccessRecord, Logger};
 use crate::mitm::cache::CertCache;
-use crate::net::{connect_upstream, relay_bidirectional, DEFAULT_CONNECT_TIMEOUT};
+use crate::net::{connect_upstream_filtered, relay_bidirectional, DEFAULT_CONNECT_TIMEOUT};
 use crate::server::HandlerFuture;
 
 /// Bound on the client and upstream TLS handshakes.
@@ -92,6 +93,7 @@ pub struct MitmInterceptor {
     upstream_tls: Arc<ClientConfig>,
     provider: Arc<CryptoProvider>,
     connect_timeout: Duration,
+    filter: Option<Arc<HostFilter>>,
 }
 
 impl fmt::Debug for MitmInterceptor {
@@ -99,6 +101,7 @@ impl fmt::Debug for MitmInterceptor {
         f.debug_struct("MitmInterceptor")
             .field("cache", &self.cache)
             .field("connect_timeout", &self.connect_timeout)
+            .field("filter", &self.filter.as_ref().map(|f| f.mode_str()))
             .finish_non_exhaustive()
     }
 }
@@ -127,11 +130,18 @@ struct Dialer {
     target: ConnectTarget,
     server_name: ServerName<'static>,
     timeout: Duration,
+    filter: Option<Arc<HostFilter>>,
 }
 
 impl Dialer {
     async fn connect(&self, alpn: Vec<Vec<u8>>) -> io::Result<ClientTlsStream<TcpStream>> {
-        let tcp = connect_upstream(&self.target.host, self.target.port, self.timeout).await?;
+        let tcp = connect_upstream_filtered(
+            &self.target.host,
+            self.target.port,
+            self.timeout,
+            self.filter.as_deref(),
+        )
+        .await?;
         let mut cfg = (*self.tls).clone();
         cfg.alpn_protocols = alpn;
         let connector = TlsConnector::from(Arc::new(cfg));
@@ -170,7 +180,14 @@ impl MitmInterceptor {
             upstream_tls,
             provider,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            filter: None,
         }
+    }
+
+    /// Enforce a destination allowlist or blocklist on every upstream dial.
+    pub fn with_filter(mut self, filter: Arc<HostFilter>) -> Self {
+        self.filter = Some(filter);
+        self
     }
 
     /// Override the upstream TCP connect timeout (default 10s).
@@ -240,6 +257,7 @@ impl MitmInterceptor {
             target: target.clone(),
             server_name,
             timeout: self.connect_timeout,
+            filter: self.filter.clone(),
         };
 
         // 2. Fresh upstream TLS connection (learn the upstream's ALPN choice first).

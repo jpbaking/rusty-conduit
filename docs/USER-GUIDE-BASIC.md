@@ -153,6 +153,18 @@ Set `--log-level DEBUG` to stream HTTP access logs and SOCKS connection logs dir
 rusty-conduit --log-level DEBUG
 ```
 
+### Block private / loopback destinations (or allowlist specific hosts)
+
+Use `--block` or `--allow` (mutually exclusive; repeatable or comma-separated) with IPs, CIDRs, exact FQDNs, or `*.domain` wildcards:
+
+```sh
+# Block loopback and RFC 1918 LAN ranges
+rusty-conduit --block 127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+
+# Allow only specific domains
+rusty-conduit --allow example.com,*.example.org
+```
+
 ### Listen on your LAN
 
 ```sh

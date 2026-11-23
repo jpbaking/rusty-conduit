@@ -1,6 +1,7 @@
 //! rusty-conduit: lightweight HTTP/HTTPS and SOCKS4/4a/5 proxy server.
 
 pub mod config;
+pub mod filter;
 pub mod http;
 pub mod logging;
 pub mod mitm;
@@ -159,16 +160,28 @@ pub async fn run(cfg: Config, logger: Logger) -> ExitCode {
     code
 }
 
-/// Build the HTTP and SOCKS engines, enabling HTTPS interception when `mitm` is present and
-/// the SOCKS web guard when additionally `--socks-block-web-in-mitm` is set.
+/// Build the HTTP and SOCKS engines, enabling destination filtering when `--allow`/`--block`
+/// is configured, HTTPS interception when `mitm` is present, and the SOCKS web guard when
+/// additionally `--socks-block-web-in-mitm` is set.
 pub fn build_engines(
     cfg: &Config,
     mitm: Option<&MitmState>,
     access: &AccessLogger,
     logger: &Logger,
 ) -> (HttpProxy, SocksProxy) {
+    let filter = cfg.host_filter().map(Arc::new);
     let mut http = HttpProxy::new(access.clone(), logger.clone());
     let mut socks = SocksProxy::new(access.clone(), logger.clone());
+    if let Some(f) = &filter {
+        logger.info(format!(
+            "destination filter enabled: {} ({} rule{})",
+            f.mode_str(),
+            f.len(),
+            if f.len() == 1 { "" } else { "s" }
+        ));
+        http = http.with_filter(Arc::clone(f));
+        socks = socks.with_filter(Arc::clone(f));
+    }
     if let Some(m) = mitm {
         logger.info(format!(
             "MITM enabled: CA \"{}\" valid until {}; leaf certificate TTL {}",
@@ -176,7 +189,11 @@ pub fn build_engines(
             logging::format_timestamp(m.ca_not_after),
             humantime::format_duration(cfg.mitm_cert_ttl)
         ));
-        http = http.with_mitm(Arc::new(m.interceptor.clone()));
+        let mut interceptor = m.interceptor.clone();
+        if let Some(f) = &filter {
+            interceptor = interceptor.with_filter(Arc::clone(f));
+        }
+        http = http.with_mitm(Arc::new(interceptor));
         if cfg.socks_block_web_in_mitm {
             logger.info("SOCKS web blocking enabled: HTTP/HTTPS over SOCKS is rejected");
             socks = socks.with_guard(Arc::new(socks::web_guard::WebGuard));

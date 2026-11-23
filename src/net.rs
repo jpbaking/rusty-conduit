@@ -4,38 +4,141 @@
 //! `lookup_host`) on **every** dial: there is no DNS cache and no connection pooling.
 
 use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
+use tokio::net::{lookup_host, TcpStream};
+use tokio::time::Instant;
+
+use crate::filter::{access_denied_error, normalize_domain, AccessDenied, HostFilter};
 
 /// Default timeout for establishing an upstream TCP connection.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn timed_out(host: &str, port: u16, timeout: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "connect to {host}:{port} timed out after {}",
+            humantime::format_duration(timeout)
+        ),
+    )
+}
+
 /// Open a fresh TCP connection to `host:port` with `TCP_NODELAY` enabled.
 ///
-/// `host` may be a DNS name or an IP literal (IPv6 literals without brackets). Name
+/// `host` may be a DNS name or an IP literal (IPv6 literals with or without brackets). Name
 /// resolution is performed by the OS on each call (zero DNS caching); every resolved address
 /// is tried in order until one connects. The whole resolve + connect sequence is bounded by
 /// `timeout`, after which an [`io::ErrorKind::TimedOut`] error is returned.
 pub async fn connect_upstream(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
+    connect_upstream_filtered(host, port, timeout, None).await
+}
+
+/// Like [`connect_upstream`], additionally enforcing an optional destination [`HostFilter`].
+///
+/// When `filter` is `Some`, both domain rules and resolved-IP IP/CIDR rules are checked before
+/// opening a TCP connection (so DNS-to-loopback / DNS-rebinding bypasses are rejected).
+pub async fn connect_upstream_filtered(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    filter: Option<&HostFilter>,
+) -> io::Result<TcpStream> {
     let host = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
-    let stream = tokio::time::timeout(timeout, TcpStream::connect((host, port)))
+
+    let Some(filter) = filter else {
+        let stream = tokio::time::timeout(timeout, TcpStream::connect((host, port)))
+            .await
+            .map_err(|_| timed_out(host, port, timeout))??;
+        stream.set_nodelay(true)?;
+        return Ok(stream);
+    };
+
+    let deadline = Instant::now() + timeout;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        filter.check_ip(ip).map_err(access_denied_error)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let stream = tokio::time::timeout(remaining, TcpStream::connect(SocketAddr::new(ip, port)))
+            .await
+            .map_err(|_| timed_out(host, port, timeout))??;
+        stream.set_nodelay(true)?;
+        return Ok(stream);
+    }
+
+    let domain = normalize_domain(host);
+    let domain_matched = filter.matches_domain(&domain);
+    match filter {
+        HostFilter::Block(_) if domain_matched => {
+            return Err(access_denied_error(AccessDenied(format!(
+                "destination {host} is blocklisted"
+            ))));
+        }
+        HostFilter::Allow(_) if !domain_matched && !filter.has_ip_rules() => {
+            return Err(access_denied_error(AccessDenied(format!(
+                "destination {host} is not in allowlist"
+            ))));
+        }
+        _ => {}
+    }
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let resolved: Vec<SocketAddr> = tokio::time::timeout(remaining, lookup_host((host, port)))
         .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "connect to {host}:{port} timed out after {}",
-                    humantime::format_duration(timeout)
-                ),
-            )
-        })??;
-    stream.set_nodelay(true)?;
-    Ok(stream)
+        .map_err(|_| timed_out(host, port, timeout))??
+        .collect();
+    if resolved.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("DNS returned no addresses for {host}"),
+        ));
+    }
+
+    let candidates: Vec<SocketAddr> = match filter {
+        HostFilter::Block(_) => {
+            if let Some(blocked) = resolved.iter().find(|a| filter.matches_ip(a.ip())) {
+                return Err(access_denied_error(AccessDenied(format!(
+                    "destination {host} resolved to blocklisted IP {}",
+                    blocked.ip()
+                ))));
+            }
+            resolved
+        }
+        HostFilter::Allow(_) if domain_matched => resolved,
+        HostFilter::Allow(_) => {
+            let allowed: Vec<SocketAddr> = resolved
+                .into_iter()
+                .filter(|a| filter.matches_ip(a.ip()))
+                .collect();
+            if allowed.is_empty() {
+                return Err(access_denied_error(AccessDenied(format!(
+                    "destination {host} is not in allowlist"
+                ))));
+            }
+            allowed
+        }
+    };
+
+    let mut last_err = None;
+    for addr in candidates {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(timed_out(host, port, timeout));
+        }
+        match tokio::time::timeout(remaining, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => {
+                stream.set_nodelay(true)?;
+                return Ok(stream);
+            }
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => return Err(timed_out(host, port, timeout)),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| timed_out(host, port, timeout)))
 }
 
 /// Relay bytes in both directions until both sides reach EOF (or either side errors).

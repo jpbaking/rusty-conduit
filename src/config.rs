@@ -19,6 +19,7 @@ use clap::parser::ValueSource;
 use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser};
 use serde::Deserialize;
 
+use crate::filter::{FilterRule, HostFilter};
 use crate::logging::{LogFormat, LogLevel};
 
 /// Default bind address.
@@ -69,6 +70,8 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    #[error("conflicting destination filter: cannot set both allowlist and blocklist")]
+    ConflictingFilter,
 }
 
 /// Raw command-line / environment input (`clap` derive with `env` fallbacks).
@@ -100,6 +103,24 @@ pub struct CliArgs {
     /// Maximum concurrent client connections; excess connections are closed immediately, 0 = unlimited [default: 4096]
     #[arg(long, value_name = "N", env = "RUSTY_CONDUIT_MAX_CONNECTIONS")]
     pub max_connections: Option<usize>,
+
+    /// Allowlist of destinations (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated
+    #[arg(
+        long,
+        value_name = "RULE",
+        value_delimiter = ',',
+        env = "RUSTY_CONDUIT_ALLOW"
+    )]
+    pub allow: Vec<FilterRule>,
+
+    /// Blocklist of destinations (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated
+    #[arg(
+        long,
+        value_name = "RULE",
+        value_delimiter = ',',
+        env = "RUSTY_CONDUIT_BLOCK"
+    )]
+    pub block: Vec<FilterRule>,
 
     /// Path to PEM-encoded CA certificate (enables MITM together with --mitm-ca-key)
     #[arg(long, value_name = "PATH", env = "RUSTY_CONDUIT_MITM_CA_CERT")]
@@ -224,6 +245,8 @@ pub struct FileConfig {
     pub http_port: Option<u16>,
     pub socks_port: Option<u16>,
     pub max_connections: Option<usize>,
+    pub allow: Option<Vec<String>>,
+    pub block: Option<Vec<String>>,
     #[serde(default)]
     pub mitm: FileMitmConfig,
     #[serde(default)]
@@ -290,6 +313,10 @@ pub struct Config {
     pub socks_port: u16,
     /// Maximum concurrent client connections (`0` = unlimited).
     pub max_connections: usize,
+    /// Destination allowlist rules (mutually exclusive with `block`).
+    pub allow: Vec<FilterRule>,
+    /// Destination blocklist rules (mutually exclusive with `allow`).
+    pub block: Vec<FilterRule>,
     pub mitm_ca_cert: Option<PathBuf>,
     pub mitm_ca_key: Option<PathBuf>,
     pub mitm_ca_p12: Option<PathBuf>,
@@ -315,6 +342,8 @@ impl fmt::Debug for Config {
             .field("http_port", &self.http_port)
             .field("socks_port", &self.socks_port)
             .field("max_connections", &self.max_connections)
+            .field("allow", &self.allow)
+            .field("block", &self.block)
             .field("mitm_ca_cert", &self.mitm_ca_cert)
             .field("mitm_ca_key", &self.mitm_ca_key)
             .field("mitm_ca_p12", &self.mitm_ca_p12)
@@ -346,6 +375,8 @@ impl Default for Config {
             http_port: DEFAULT_HTTP_PORT,
             socks_port: DEFAULT_SOCKS_PORT,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            allow: Vec::new(),
+            block: Vec::new(),
             mitm_ca_cert: None,
             mitm_ca_key: None,
             mitm_ca_p12: None,
@@ -423,6 +454,18 @@ impl Config {
                 .socks_block_web
                 .unwrap_or(d.socks_block_web_in_mitm)
         };
+        let file_allow = file_filter_rules("allow", file.allow)?;
+        let file_block = file_filter_rules("block", file.block)?;
+        let allow = if a.allow.is_empty() {
+            file_allow
+        } else {
+            a.allow
+        };
+        let block = if a.block.is_empty() {
+            file_block
+        } else {
+            a.block
+        };
 
         Ok(Config {
             config_path: a.config,
@@ -433,6 +476,8 @@ impl Config {
                 .max_connections
                 .or(file.max_connections)
                 .unwrap_or(d.max_connections),
+            allow,
+            block,
             mitm_ca_cert: a.mitm_ca_cert.or(file.mitm.ca_cert),
             mitm_ca_key: a.mitm_ca_key.or(file.mitm.ca_key),
             mitm_ca_p12: a.mitm_ca_p12.or(file.mitm.ca_p12),
@@ -470,7 +515,21 @@ impl Config {
         if self.mitm_cert_ttl < MIN_MITM_CERT_TTL {
             return Err(ConfigError::CertTtlTooShort(self.mitm_cert_ttl));
         }
+        if !self.allow.is_empty() && !self.block.is_empty() {
+            return Err(ConfigError::ConflictingFilter);
+        }
         Ok(())
+    }
+
+    /// The configured destination filter, or `None` when unfiltered.
+    pub fn host_filter(&self) -> Option<HostFilter> {
+        if !self.allow.is_empty() {
+            Some(HostFilter::Allow(self.allow.clone()))
+        } else if !self.block.is_empty() {
+            Some(HostFilter::Block(self.block.clone()))
+        } else {
+            None
+        }
     }
 
     /// The configured MITM CA source, or `None` when MITM mode is OFF.
@@ -582,10 +641,14 @@ impl Config {
             Some(CaSource::Pkcs12 { .. }) => "on(pkcs12)",
             None => "off",
         };
+        let filter = self
+            .host_filter()
+            .map(|f| format!(" filter={}({})", f.mode_str(), f.len()))
+            .unwrap_or_default();
         format!(
             "bind={} http_port={} socks_port={} multiplexed={} max_connections={} mitm={} \
              mitm_cert_ttl={} mitm_cert_cache_max_entries={} socks_block_web_in_mitm={} log_level={} log_format={} http_access_log={} socks_log={} \
-             config={}",
+             config={}{filter}",
             self.bind,
             port(self.http_port),
             port(self.socks_port),
@@ -604,6 +667,22 @@ impl Config {
     }
 }
 
+fn file_filter_rules(
+    key: &'static str,
+    raw: Option<Vec<String>>,
+) -> Result<Vec<FilterRule>, ConfigError> {
+    let Some(entries) = raw else {
+        return Ok(Vec::new());
+    };
+    entries
+        .into_iter()
+        .map(|s| {
+            s.parse::<FilterRule>()
+                .map_err(|message| ConfigError::InvalidFileValue { key, message })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,6 +698,8 @@ mod tests {
         "RUSTY_CONDUIT_HTTP_PORT",
         "RUSTY_CONDUIT_SOCKS_PORT",
         "RUSTY_CONDUIT_MAX_CONNECTIONS",
+        "RUSTY_CONDUIT_ALLOW",
+        "RUSTY_CONDUIT_BLOCK",
         "RUSTY_CONDUIT_MITM_CERT_CACHE_MAX_ENTRIES",
         "RUSTY_CONDUIT_MITM_CA_CERT",
         "RUSTY_CONDUIT_MITM_CA_KEY",
@@ -1190,5 +1271,66 @@ socks_log = "/file/socks.log"
         let s = cfg.summary();
         assert!(s.contains("mitm=on(pkcs12)"));
         assert!(!s.contains("s3cret"));
+    }
+
+    #[test]
+    fn filter_cli_env_toml_and_conflict_validation() {
+        let _env = EnvGuard::new(&[]);
+        // CLI repeatable + comma-separated
+        let cfg = load(&[
+            "--allow",
+            "*.example.com,10.0.0.0/8",
+            "--allow",
+            "127.0.0.1",
+        ])
+        .unwrap();
+        assert_eq!(cfg.allow.len(), 3);
+        assert!(cfg.block.is_empty());
+        assert!(matches!(cfg.host_filter(), Some(HostFilter::Allow(_))));
+        let s = cfg.summary();
+        assert!(s.contains("filter=allow(3)"), "{s}");
+
+        // Mutual exclusion: allow + block
+        let err = load(&["--allow", "example.com", "--block", "127.0.0.1"]).unwrap_err();
+        assert!(matches!(err, ConfigError::ConflictingFilter), "{err:?}");
+
+        // TOML parsing
+        let toml_path = temp_file(
+            r#"
+allow = ["example.com", "192.168.0.0/16"]
+"#,
+        );
+        let cfg = load(&["--config", toml_path.to_str().unwrap()]).unwrap();
+        assert_eq!(cfg.allow.len(), 2);
+        assert!(cfg.block.is_empty());
+
+        // Cross-source conflict (TOML allow + CLI block) is rejected
+        let err = load(&[
+            "--config",
+            toml_path.to_str().unwrap(),
+            "--block",
+            "10.0.0.0/8",
+        ])
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::ConflictingFilter), "{err:?}");
+
+        // Env var override
+        drop(_env);
+        let _env = EnvGuard::new(&[("RUSTY_CONDUIT_BLOCK", "127.0.0.0/8,::1,*.internal")]);
+        let cfg = load(&[]).unwrap();
+        assert_eq!(cfg.block.len(), 3);
+        assert!(matches!(cfg.host_filter(), Some(HostFilter::Block(_))));
+        assert!(cfg.summary().contains("filter=block(3)"));
+
+        // Invalid TOML rule fails with InvalidFileValue
+        let bad_toml = temp_file("block = [\"foo.*.example.com\"]\n");
+        let err = load(&["--config", bad_toml.to_str().unwrap()]).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidFileValue { key: "block", .. }),
+            "{err:?}"
+        );
+
+        let _ = fs::remove_file(&toml_path);
+        let _ = fs::remove_file(&bad_toml);
     }
 }
