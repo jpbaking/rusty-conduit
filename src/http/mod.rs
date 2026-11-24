@@ -39,7 +39,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::filter::HostFilter;
 use crate::logging::{AccessLogger, HttpAccessRecord, Logger};
-use crate::net::DEFAULT_CONNECT_TIMEOUT;
+use crate::net::{KeepaliveSettings, DEFAULT_CONNECT_TIMEOUT};
 use crate::server::{Connection, HandlerFuture};
 
 /// Boxed error type used by proxied bodies.
@@ -129,6 +129,7 @@ pub struct HttpProxy {
     connect_timeout: Duration,
     mitm: Option<Arc<dyn MitmHandler>>,
     pub(crate) filter: Option<Arc<HostFilter>>,
+    pub(crate) keepalive: Option<KeepaliveSettings>,
 }
 
 impl fmt::Debug for HttpProxy {
@@ -137,6 +138,7 @@ impl fmt::Debug for HttpProxy {
             .field("connect_timeout", &self.connect_timeout)
             .field("mitm", &self.mitm.is_some())
             .field("filter", &self.filter.as_ref().map(|f| f.mode_str()))
+            .field("keepalive", &self.keepalive)
             .finish_non_exhaustive()
     }
 }
@@ -149,12 +151,20 @@ impl HttpProxy {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             mitm: None,
             filter: None,
+            keepalive: Some(KeepaliveSettings::DEFAULT),
         }
     }
 
     /// Enforce a destination allowlist or blocklist on every upstream dial.
     pub fn with_filter(mut self, filter: Arc<HostFilter>) -> Self {
         self.filter = Some(filter);
+        self
+    }
+
+    /// Set TCP keepalive for upstream sockets (`None` disables; default
+    /// [`KeepaliveSettings::DEFAULT`]).
+    pub fn with_tcp_keepalive(mut self, keepalive: Option<KeepaliveSettings>) -> Self {
+        self.keepalive = keepalive;
         self
     }
 

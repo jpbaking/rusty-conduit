@@ -16,6 +16,85 @@ use crate::filter::{access_denied_error, normalize_domain, AccessDenied, HostFil
 /// Default timeout for establishing an upstream TCP connection.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// TCP keepalive parameters applied to client and upstream sockets.
+///
+/// Probes are sent by the OS kernel only while a connection is completely idle; they carry no
+/// payload and are invisible to HTTP, TLS, SOCKS, and any tunneled protocol. They keep NAT /
+/// firewall / VPN state alive during long silent periods and let dead peers be detected after
+/// roughly `idle + interval * retries`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeepaliveSettings {
+    /// Idle time before the first probe is sent.
+    pub idle: Duration,
+    /// Time between unanswered probes.
+    pub interval: Duration,
+    /// Unanswered probes before the OS closes the connection.
+    pub retries: u32,
+}
+
+impl KeepaliveSettings {
+    /// Default: first probe after 60s idle, then every 10s, give up after 5 misses.
+    pub const DEFAULT: Self = Self {
+        idle: Duration::from_secs(60),
+        interval: Duration::from_secs(10),
+        retries: 5,
+    };
+
+    /// Enable `SO_KEEPALIVE` on `stream` with these parameters. On platforms without
+    /// per-socket interval / retry control only the idle time is applied.
+    pub fn apply(&self, stream: &TcpStream) -> io::Result<()> {
+        let params = socket2::TcpKeepalive::new().with_time(self.idle);
+        #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "windows",
+        ))]
+        let params = params
+            .with_interval(self.interval)
+            .with_retries(self.retries);
+        socket2::SockRef::from(stream).set_tcp_keepalive(&params)
+    }
+}
+
+impl Default for KeepaliveSettings {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl std::fmt::Display for KeepaliveSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "idle={} interval={} retries={}",
+            humantime::format_duration(self.idle),
+            humantime::format_duration(self.interval),
+            self.retries
+        )
+    }
+}
+
+/// Configure a freshly dialed upstream socket: `TCP_NODELAY` plus optional keepalive.
+///
+/// A keepalive failure is not fatal: the connection still works, it just will not probe.
+fn prepare_upstream(
+    stream: TcpStream,
+    keepalive: Option<&KeepaliveSettings>,
+) -> io::Result<TcpStream> {
+    stream.set_nodelay(true)?;
+    if let Some(ka) = keepalive {
+        let _ = ka.apply(&stream);
+    }
+    Ok(stream)
+}
+
 fn timed_out(host: &str, port: u16, timeout: Duration) -> io::Error {
     io::Error::new(
         io::ErrorKind::TimedOut,
@@ -26,25 +105,27 @@ fn timed_out(host: &str, port: u16, timeout: Duration) -> io::Error {
     )
 }
 
-/// Open a fresh TCP connection to `host:port` with `TCP_NODELAY` enabled.
+/// Open a fresh TCP connection to `host:port` with `TCP_NODELAY` enabled (no keepalive).
 ///
 /// `host` may be a DNS name or an IP literal (IPv6 literals with or without brackets). Name
 /// resolution is performed by the OS on each call (zero DNS caching); every resolved address
 /// is tried in order until one connects. The whole resolve + connect sequence is bounded by
 /// `timeout`, after which an [`io::ErrorKind::TimedOut`] error is returned.
 pub async fn connect_upstream(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
-    connect_upstream_filtered(host, port, timeout, None).await
+    connect_upstream_filtered(host, port, timeout, None, None).await
 }
 
 /// Like [`connect_upstream`], additionally enforcing an optional destination [`HostFilter`].
 ///
 /// When `filter` is `Some`, both domain rules and resolved-IP IP/CIDR rules are checked before
 /// opening a TCP connection (so DNS-to-loopback / DNS-rebinding bypasses are rejected).
+/// When `keepalive` is `Some`, TCP keepalive is enabled on the connected socket.
 pub async fn connect_upstream_filtered(
     host: &str,
     port: u16,
     timeout: Duration,
     filter: Option<&HostFilter>,
+    keepalive: Option<&KeepaliveSettings>,
 ) -> io::Result<TcpStream> {
     let host = host
         .strip_prefix('[')
@@ -55,8 +136,7 @@ pub async fn connect_upstream_filtered(
         let stream = tokio::time::timeout(timeout, TcpStream::connect((host, port)))
             .await
             .map_err(|_| timed_out(host, port, timeout))??;
-        stream.set_nodelay(true)?;
-        return Ok(stream);
+        return prepare_upstream(stream, keepalive);
     };
 
     let deadline = Instant::now() + timeout;
@@ -66,8 +146,7 @@ pub async fn connect_upstream_filtered(
         let stream = tokio::time::timeout(remaining, TcpStream::connect(SocketAddr::new(ip, port)))
             .await
             .map_err(|_| timed_out(host, port, timeout))??;
-        stream.set_nodelay(true)?;
-        return Ok(stream);
+        return prepare_upstream(stream, keepalive);
     }
 
     let domain = normalize_domain(host);
@@ -130,10 +209,7 @@ pub async fn connect_upstream_filtered(
             return Err(timed_out(host, port, timeout));
         }
         match tokio::time::timeout(remaining, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => {
-                stream.set_nodelay(true)?;
-                return Ok(stream);
-            }
+            Ok(Ok(stream)) => return prepare_upstream(stream, keepalive),
             Ok(Err(e)) => last_err = Some(e),
             Err(_) => return Err(timed_out(host, port, timeout)),
         }
@@ -241,6 +317,44 @@ mod tests {
         connect_upstream("[::1]", port, Duration::from_secs(5))
             .await
             .unwrap();
+        accept.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_dial_applies_keepalive_settings() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let ka = KeepaliveSettings {
+            idle: Duration::from_secs(45),
+            interval: Duration::from_secs(7),
+            retries: 4,
+        };
+        let stream =
+            connect_upstream_filtered("127.0.0.1", port, Duration::from_secs(5), None, Some(&ka))
+                .await
+                .unwrap();
+        let sock = socket2::SockRef::from(&stream);
+        assert!(sock.keepalive().unwrap());
+        assert!(stream.nodelay().unwrap());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert_eq!(sock.tcp_keepalive_time().unwrap(), ka.idle);
+            assert_eq!(sock.tcp_keepalive_interval().unwrap(), ka.interval);
+            assert_eq!(sock.tcp_keepalive_retries().unwrap(), ka.retries);
+        }
+        accept.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_dial_without_keepalive_leaves_it_off() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let stream = connect_upstream("127.0.0.1", port, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(!socket2::SockRef::from(&stream).keepalive().unwrap());
         accept.await.unwrap().unwrap();
     }
 }

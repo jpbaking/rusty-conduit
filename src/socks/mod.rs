@@ -43,7 +43,7 @@ use crate::filter::HostFilter;
 use crate::http::tunnel::CountingStream;
 use crate::logging::{AccessLogger, Logger, SocksLogRecord};
 use crate::mux::{self, DetectedProtocol};
-use crate::net::{relay_bidirectional, DEFAULT_CONNECT_TIMEOUT};
+use crate::net::{relay_bidirectional, KeepaliveSettings, DEFAULT_CONNECT_TIMEOUT};
 use crate::server::Connection;
 
 /// Default bound on how long a client may take to complete the SOCKS handshake.
@@ -166,6 +166,7 @@ pub struct SocksProxy {
     pub(crate) handshake_timeout: Duration,
     pub(crate) guard: Option<Arc<dyn RelayGuard>>,
     pub(crate) filter: Option<Arc<HostFilter>>,
+    pub(crate) keepalive: Option<KeepaliveSettings>,
 }
 
 impl fmt::Debug for SocksProxy {
@@ -175,6 +176,7 @@ impl fmt::Debug for SocksProxy {
             .field("handshake_timeout", &self.handshake_timeout)
             .field("guard", &self.guard.is_some())
             .field("filter", &self.filter.as_ref().map(|f| f.mode_str()))
+            .field("keepalive", &self.keepalive)
             .finish_non_exhaustive()
     }
 }
@@ -188,12 +190,20 @@ impl SocksProxy {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             guard: None,
             filter: None,
+            keepalive: Some(KeepaliveSettings::DEFAULT),
         }
     }
 
     /// Enforce a destination allowlist or blocklist on every upstream dial.
     pub fn with_filter(mut self, filter: Arc<HostFilter>) -> Self {
         self.filter = Some(filter);
+        self
+    }
+
+    /// Set TCP keepalive for upstream sockets (`None` disables; default
+    /// [`KeepaliveSettings::DEFAULT`]).
+    pub fn with_tcp_keepalive(mut self, keepalive: Option<KeepaliveSettings>) -> Self {
+        self.keepalive = keepalive;
         self
     }
 

@@ -56,7 +56,9 @@ use super::{
 use crate::filter::HostFilter;
 use crate::logging::{AccessLogger, HttpAccessRecord, Logger};
 use crate::mitm::cache::CertCache;
-use crate::net::{connect_upstream_filtered, relay_bidirectional, DEFAULT_CONNECT_TIMEOUT};
+use crate::net::{
+    connect_upstream_filtered, relay_bidirectional, KeepaliveSettings, DEFAULT_CONNECT_TIMEOUT,
+};
 use crate::server::HandlerFuture;
 
 /// Bound on the client and upstream TLS handshakes.
@@ -94,6 +96,7 @@ pub struct MitmInterceptor {
     provider: Arc<CryptoProvider>,
     connect_timeout: Duration,
     filter: Option<Arc<HostFilter>>,
+    keepalive: Option<KeepaliveSettings>,
 }
 
 impl fmt::Debug for MitmInterceptor {
@@ -102,6 +105,7 @@ impl fmt::Debug for MitmInterceptor {
             .field("cache", &self.cache)
             .field("connect_timeout", &self.connect_timeout)
             .field("filter", &self.filter.as_ref().map(|f| f.mode_str()))
+            .field("keepalive", &self.keepalive)
             .finish_non_exhaustive()
     }
 }
@@ -131,6 +135,7 @@ struct Dialer {
     server_name: ServerName<'static>,
     timeout: Duration,
     filter: Option<Arc<HostFilter>>,
+    keepalive: Option<KeepaliveSettings>,
 }
 
 impl Dialer {
@@ -140,6 +145,7 @@ impl Dialer {
             self.target.port,
             self.timeout,
             self.filter.as_deref(),
+            self.keepalive.as_ref(),
         )
         .await?;
         let mut cfg = (*self.tls).clone();
@@ -181,12 +187,20 @@ impl MitmInterceptor {
             provider,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             filter: None,
+            keepalive: Some(KeepaliveSettings::DEFAULT),
         }
     }
 
     /// Enforce a destination allowlist or blocklist on every upstream dial.
     pub fn with_filter(mut self, filter: Arc<HostFilter>) -> Self {
         self.filter = Some(filter);
+        self
+    }
+
+    /// Set TCP keepalive for upstream sockets (`None` disables; default
+    /// [`KeepaliveSettings::DEFAULT`]).
+    pub fn with_tcp_keepalive(mut self, keepalive: Option<KeepaliveSettings>) -> Self {
+        self.keepalive = keepalive;
         self
     }
 
@@ -258,6 +272,7 @@ impl MitmInterceptor {
             server_name,
             timeout: self.connect_timeout,
             filter: self.filter.clone(),
+            keepalive: self.keepalive,
         };
 
         // 2. Fresh upstream TLS connection (learn the upstream's ALPN choice first).

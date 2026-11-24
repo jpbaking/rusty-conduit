@@ -26,6 +26,9 @@ Settings are merged in strict order (higher overrides lower):
 | `--http-port <PORT>` | `RUSTY_CONDUIT_HTTP_PORT` | `http_port` | `3128` | HTTP/HTTPS proxy port (`0` disables) |
 | `--socks-port <PORT>` | `RUSTY_CONDUIT_SOCKS_PORT` | `socks_port` | `1080` | SOCKS4/4a/5 proxy port (`0` disables) |
 | `--max-connections <N>` | `RUSTY_CONDUIT_MAX_CONNECTIONS` | `max_connections` | `4096` | Max concurrent connections across all listeners (`0` = unlimited) |
+| `--tcp-keepalive <DURATION>` | `RUSTY_CONDUIT_TCP_KEEPALIVE` | `tcp_keepalive` | `60s` | Idle time before TCP keepalive probes start on client and upstream sockets (`0` disables; `1s`–`32767s`) |
+| `--tcp-keepalive-interval <DURATION>` | `RUSTY_CONDUIT_TCP_KEEPALIVE_INTERVAL` | `tcp_keepalive_interval` | `10s` | Time between unanswered keepalive probes (`1s`–`32767s`) |
+| `--tcp-keepalive-retries <N>` | `RUSTY_CONDUIT_TCP_KEEPALIVE_RETRIES` | `tcp_keepalive_retries` | `5` | Unanswered probes before the OS closes the connection (`1`–`127`) |
 | `--allow <RULE>` | `RUSTY_CONDUIT_ALLOW` | `allow` | *(none)* | Destination allowlist (IP, CIDR, FQDN, or `*.domain`); mutually exclusive with `--block` |
 | `--block <RULE>` | `RUSTY_CONDUIT_BLOCK` | `block` | *(none)* | Destination blocklist (IP, CIDR, FQDN, or `*.domain`); mutually exclusive with `--allow` |
 | `--mitm-ca-cert <PATH>` | `RUSTY_CONDUIT_MITM_CA_CERT` | `mitm.ca_cert` | *(none)* | PEM CA certificate (enables MITM with `--mitm-ca-key`) |
@@ -49,6 +52,9 @@ bind = "127.0.0.1"
 http_port = 3128
 socks_port = 1080
 max_connections = 4096
+tcp_keepalive = "60s"          # "0" disables
+tcp_keepalive_interval = "10s"
+tcp_keepalive_retries = 5
 # Optional destination filter — set EITHER `allow` OR `block`, never both:
 # block = ["127.0.0.0/8", "::1", "10.0.0.0/8", "*.internal"]
 # allow = ["example.com", "*.example.org", "203.0.113.0/24"]
@@ -88,6 +94,7 @@ rusty-conduit --config /etc/rusty-conduit/rusty-conduit.toml --http-port 8080
 - Supplying only one of `--mitm-ca-cert` or `--mitm-ca-key`.
 - Supplying both `--mitm-ca-passphrase` and `--mitm-ca-passphrase-file`.
 - `--mitm-cert-ttl` shorter than `10s`.
+- `--tcp-keepalive` not `0` and outside `1s`–`32767s`; or, while keepalive is enabled, `--tcp-keepalive-interval` outside `1s`–`32767s` or `--tcp-keepalive-retries` outside `1`–`127`.
 - Unreadable, expired, not-yet-valid, or mismatched CA cert/key, wrong PKCS#12 passphrase, or legacy `Proc-Type: 4,ENCRYPTED` PEM key.
 - Port bind failure or unopenable log file path.
 
@@ -195,7 +202,20 @@ rusty-conduit --log-level DEBUG --log-format json 2>/dev/null \
 
 ---
 
-## 5. Protocol Matrix (v1)
+## 5. Connection Lifetime & TCP Keepalive
+
+Once a tunnel, SOCKS relay, or HTTP connection is established, rusty-conduit applies **no idle or total-lifetime timeout**: a connection stays open as long as both peers keep it open, however long it sits silent. The only time limits are setup-phase ones (protocol sniff `5s`, SOCKS handshake `10s`, upstream connect `10s`, MITM TLS handshake `10s`) and the `5s` drain on shutdown.
+
+Silent connections can still be dropped **outside** the proxy: NAT gateways, firewalls, VPN concentrators (e.g. OpenVPN servers), Docker/Kubernetes conntrack, and cloud load balancers expire idle flows, often without notifying either end. Long-polling clients, such as AI agents waiting on a model response, are the typical victims.
+
+To keep that state alive, rusty-conduit enables OS-level **TCP keepalive** on every accepted client socket and every upstream socket (HTTP forward, `CONNECT`, MITM, SOCKS4/4a/5). By default, the first probe is sent after `60s` idle, then every `10s`, and the connection is closed after `5` unanswered probes (~110s after the peer vanishes).
+
+- Probes are empty TCP segments handled by the kernel. They are invisible to HTTP, TLS, SOCKS, and any tunneled protocol (SSH, database protocols, etc.) and add ~60 bytes per idle interval.
+- Probes keep each hop (client ↔ proxy, proxy ↔ destination) alive. They are not forwarded end to end, and they cannot save a connection whose path is fully broken, such as an OpenVPN tunnel restart.
+- For SSH through SOCKS, also set `ServerAliveInterval` (e.g. `30`) in `~/.ssh/config`. It works end to end inside the encrypted session.
+- Set `--tcp-keepalive 0` to disable. On platforms without per-socket interval/retry control, only the idle time is applied.
+
+## 6. Protocol Matrix (v1)
 
 | Protocol | Supported | Not in v1 (see [FUTURE-PLANS.md](../FUTURE-PLANS.md)) |
 | :--- | :--- | :--- |

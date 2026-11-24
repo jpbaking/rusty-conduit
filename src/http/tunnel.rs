@@ -45,6 +45,7 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
         target.port,
         ctx.proxy.connect_timeout,
         ctx.proxy.filter.as_deref(),
+        ctx.proxy.keepalive.as_ref(),
     )
     .await
     {

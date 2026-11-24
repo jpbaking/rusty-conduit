@@ -170,8 +170,9 @@ pub fn build_engines(
     logger: &Logger,
 ) -> (HttpProxy, SocksProxy) {
     let filter = cfg.host_filter().map(Arc::new);
-    let mut http = HttpProxy::new(access.clone(), logger.clone());
-    let mut socks = SocksProxy::new(access.clone(), logger.clone());
+    let keepalive = cfg.tcp_keepalive_settings();
+    let mut http = HttpProxy::new(access.clone(), logger.clone()).with_tcp_keepalive(keepalive);
+    let mut socks = SocksProxy::new(access.clone(), logger.clone()).with_tcp_keepalive(keepalive);
     if let Some(f) = &filter {
         logger.info(format!(
             "destination filter enabled: {} ({} rule{})",
@@ -189,7 +190,7 @@ pub fn build_engines(
             logging::format_timestamp(m.ca_not_after),
             humantime::format_duration(cfg.mitm_cert_ttl)
         ));
-        let mut interceptor = m.interceptor.clone();
+        let mut interceptor = m.interceptor.clone().with_tcp_keepalive(keepalive);
         if let Some(f) = &filter {
             interceptor = interceptor.with_filter(Arc::clone(f));
         }

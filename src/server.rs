@@ -33,6 +33,7 @@ use tokio_util::task::TaskTracker;
 use crate::config::Config;
 use crate::logging::Logger;
 use crate::mux::{self, DetectedProtocol, DEFAULT_SNIFF_TIMEOUT};
+use crate::net::KeepaliveSettings;
 
 /// Default bound on how long in-flight connections may drain after shutdown starts.
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -180,6 +181,8 @@ pub struct Server {
     drain_timeout: Duration,
     /// `None` means unlimited.
     connection_limit: Option<Arc<Semaphore>>,
+    /// TCP keepalive for accepted client sockets (`None` = disabled).
+    keepalive: Option<KeepaliveSettings>,
 }
 
 impl fmt::Debug for Server {
@@ -189,6 +192,7 @@ impl fmt::Debug for Server {
             .field("socks_addr", &self.local_socks_addr())
             .field("sniff_timeout", &self.sniff_timeout)
             .field("drain_timeout", &self.drain_timeout)
+            .field("keepalive", &self.keepalive)
             .finish_non_exhaustive()
     }
 }
@@ -227,6 +231,7 @@ impl Server {
             sniff_timeout: DEFAULT_SNIFF_TIMEOUT,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
             connection_limit: None,
+            keepalive: Some(KeepaliveSettings::DEFAULT),
         })
     }
 
@@ -238,7 +243,8 @@ impl Server {
     ) -> Result<Self, ServerError> {
         Ok(Self::bind(ListenPlan::from_config(cfg), handlers, logger)
             .await?
-            .with_max_connections(cfg.max_connections))
+            .with_max_connections(cfg.max_connections)
+            .with_tcp_keepalive(cfg.tcp_keepalive_settings()))
     }
 
     /// Cap concurrent connections across all listeners (`0` = unlimited). Values above
@@ -246,6 +252,13 @@ impl Server {
     pub fn with_max_connections(mut self, max: usize) -> Self {
         self.connection_limit =
             (max > 0).then(|| Arc::new(Semaphore::new(max.min(Semaphore::MAX_PERMITS))));
+        self
+    }
+
+    /// Set TCP keepalive for accepted client sockets (`None` disables; default
+    /// [`KeepaliveSettings::DEFAULT`]).
+    pub fn with_tcp_keepalive(mut self, keepalive: Option<KeepaliveSettings>) -> Self {
+        self.keepalive = keepalive;
         self
     }
 
@@ -311,6 +324,7 @@ impl Server {
             sniff_timeout,
             drain_timeout,
             connection_limit,
+            keepalive,
         } = self;
 
         let mut accept_loops = tokio::task::JoinSet::new();
@@ -325,6 +339,7 @@ impl Server {
                 tracker: tracker.clone(),
                 sniff_timeout,
                 connection_limit: connection_limit.clone(),
+                keepalive,
             }));
         }
         while accept_loops.join_next().await.is_some() {}
@@ -361,6 +376,7 @@ struct AcceptCtx {
     tracker: TaskTracker,
     sniff_timeout: Duration,
     connection_limit: Option<Arc<Semaphore>>,
+    keepalive: Option<KeepaliveSettings>,
 }
 
 async fn accept_loop(ctx: AcceptCtx) {
@@ -397,6 +413,12 @@ async fn accept_loop(ctx: AcceptCtx) {
             },
             None => None,
         };
+        if let Some(ka) = &ctx.keepalive {
+            if let Err(e) = ka.apply(&stream) {
+                ctx.logger
+                    .debug(format!("failed to enable TCP keepalive for {peer}: {e}"));
+            }
+        }
         ctx.logger.verbose(format!(
             "accepted connection from {peer} on {} listener {}",
             ctx.role, ctx.addr
@@ -482,12 +504,16 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         seen: Mutex<Vec<(&'static str, u8)>>,
+        /// Whether `SO_KEEPALIVE` was set on each accepted client socket.
+        keepalive: Mutex<Vec<bool>>,
     }
 
     impl Recorder {
         fn handle(self: &Arc<Self>, tag: &'static str, mut conn: Connection) -> HandlerFuture {
             let me = Arc::clone(self);
             Box::pin(async move {
+                let ka = socket2::SockRef::from(&conn.stream).keepalive().unwrap();
+                me.keepalive.lock().unwrap().push(ka);
                 let mut first = [0u8; 1];
                 conn.stream.read_exact(&mut first).await.unwrap();
                 me.seen.lock().unwrap().push((tag, first[0]));
@@ -600,6 +626,29 @@ mod tests {
                 assert_eq!(a, addr);
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_client_sockets_get_tcp_keepalive() {
+        for (keepalive, expected) in [(Some(KeepaliveSettings::DEFAULT), true), (None, false)] {
+            let (server, rec) = start(ListenPlan::Separate {
+                http: Some(loopback(0)),
+                socks: Some(loopback(0)),
+            })
+            .await;
+            let server = server.with_tcp_keepalive(keepalive);
+            let http = server.local_http_addr().unwrap();
+            let socks = server.local_socks_addr().unwrap();
+            let token = server.shutdown_token();
+            let run = tokio::spawn(server.run());
+
+            assert_eq!(roundtrip(http, b"GET / HTTP/1.1\r\n\r\n").await, b"http");
+            assert_eq!(roundtrip(socks, &[0x05, 0x01, 0x00]).await, b"socks5");
+            assert_eq!(*rec.keepalive.lock().unwrap(), vec![expected; 2]);
+
+            token.cancel();
+            run.await.unwrap();
         }
     }
 

@@ -151,6 +151,7 @@ pub(super) async fn serve(proxy: &SocksProxy, mut conn: Connection) {
         req.target.port,
         proxy.connect_timeout,
         proxy.filter.as_deref(),
+        proxy.keepalive.as_ref(),
     );
     let upstream = tokio::select! {
         () = conn.shutdown.cancelled() => return,
