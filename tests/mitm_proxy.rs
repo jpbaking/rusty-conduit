@@ -260,7 +260,13 @@ impl MitmProxy {
         let mut roots = RootCertStore::empty();
         roots.add(origin.ca_der.clone()).unwrap();
         let upstream = client_config_with_roots(Arc::clone(&provider), roots).unwrap();
-        let state = MitmState::build(&cfg, &cfg.ca_source().unwrap(), provider, upstream).unwrap();
+        let state = MitmState::build(
+            &cfg.mitm_options(),
+            &cfg.ca_source().unwrap(),
+            provider,
+            upstream,
+        )
+        .unwrap();
 
         let logger = quiet_logger();
         let access = AccessLogger::start(

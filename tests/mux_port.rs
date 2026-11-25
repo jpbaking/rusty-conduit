@@ -72,7 +72,9 @@ async fn server_for(cfg: &Config, access: &AccessLogger) -> Server {
     let logger = quiet_logger();
     let (http, socks) = build_engines(cfg, None, access, &logger);
     let handlers: Arc<dyn ProtocolHandlers> = Arc::new(EngineHandlers::new(http, socks));
-    Server::from_config(cfg, handlers, logger).await.unwrap()
+    Server::from_options(&cfg.server_options(), handlers, logger)
+        .await
+        .unwrap()
 }
 
 /// HTTP/1.1 origin returning `origin:<path>` and closing.
@@ -243,7 +245,7 @@ async fn one_port_serves_http_https_socks4_and_socks5() {
     cfg.validate().unwrap();
     assert!(cfg.is_multiplexed());
     assert_eq!(
-        ListenPlan::from_config(&cfg),
+        ListenPlan::from_options(&cfg.server_options()),
         ListenPlan::Multiplexed(SocketAddr::from(([127, 0, 0, 1], port)))
     );
 
@@ -457,7 +459,7 @@ async fn both_ports_zero_is_rejected() {
     };
     let (http, socks) = build_engines(&cfg, None, &access, &quiet_logger());
     let handlers: Arc<dyn ProtocolHandlers> = Arc::new(EngineHandlers::new(http, socks));
-    let err = Server::from_config(&cfg, handlers, quiet_logger())
+    let err = Server::from_options(&cfg.server_options(), handlers, quiet_logger())
         .await
         .unwrap_err();
     assert!(matches!(err, ServerError::NoListeners), "{err}");

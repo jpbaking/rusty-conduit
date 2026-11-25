@@ -1,14 +1,17 @@
 //! rusty-conduit: lightweight HTTP/HTTPS and SOCKS4/4a/5 proxy server.
+//!
+//! The proxy engine (listeners and multiplexing, HTTP/HTTPS and SOCKS4/4a/5, HTTPS MITM,
+//! destination filtering, socket helpers, and logging) lives in `rusty-conduit-engine`; its
+//! modules are re-exported here so the integration tests keep using `rusty_conduit::...`.
+//! This crate owns the CLI / env / TOML layer ([`config`]) and maps it onto the engine with a
+//! fixed `direct` route and no routing rules.
 
 pub mod config;
-pub mod filter;
-pub mod http;
-pub mod logging;
-pub mod mitm;
-pub mod mux;
-pub mod net;
-pub mod server;
-pub mod socks;
+#[cfg(test)]
+mod test_support;
+
+pub use rusty_conduit_engine::{filter, http, logging, mitm, mux, net, routing, server, socks};
+pub use server::EngineHandlers;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -17,40 +20,13 @@ use config::{CliInput, Config};
 use http::HttpProxy;
 use logging::{AccessLogConfig, AccessLogger, LogLevel, Logger};
 use mitm::MitmState;
-use server::{Connection, HandlerFuture, ProtocolHandlers, Server};
+use routing::{RoutingSetupError, RoutingState, SharedRouting};
+use rusty_conduit_engine::upstream::DialerOptions;
+use server::{ProtocolHandlers, Server};
 use socks::SocksProxy;
 
 /// Exit code used for `FATAL` startup errors.
 pub const EXIT_FATAL: u8 = 1;
-
-/// Protocol engines wired into the [`Server`]: the HTTP/HTTPS proxy for HTTP connections
-/// and the SOCKS4/4a/5 engine for SOCKS connections (dedicated and multiplexed listeners).
-#[derive(Debug, Clone)]
-pub struct EngineHandlers {
-    http: HttpProxy,
-    socks: SocksProxy,
-}
-
-impl EngineHandlers {
-    pub fn new(http: HttpProxy, socks: SocksProxy) -> Self {
-        Self { http, socks }
-    }
-}
-
-impl ProtocolHandlers for EngineHandlers {
-    fn http(&self, conn: Connection) -> HandlerFuture {
-        let proxy = self.http.clone();
-        Box::pin(async move { proxy.serve(conn).await })
-    }
-    fn socks4(&self, conn: Connection) -> HandlerFuture {
-        let proxy = self.socks.clone();
-        Box::pin(async move { proxy.serve_v4(conn).await })
-    }
-    fn socks5(&self, conn: Connection) -> HandlerFuture {
-        let proxy = self.socks.clone();
-        Box::pin(async move { proxy.serve_v5(conn).await })
-    }
-}
 
 /// Merge and validate configuration from parsed CLI/env input.
 ///
@@ -88,7 +64,8 @@ pub async fn run(cfg: Config, logger: Logger) -> ExitCode {
             cfg.log_format,
             cfg.http_access_log.clone(),
             cfg.socks_log.clone(),
-        ),
+        )
+        .with_routing_fields(false),
         logger.clone(),
     )
     .await
@@ -100,7 +77,16 @@ pub async fn run(cfg: Config, logger: Logger) -> ExitCode {
         }
     };
 
-    let mitm = match MitmState::from_config(&cfg) {
+    let routing = match routing_state(&cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            logger.fatal(format!("config invalid: {e}"));
+            let _ = access.shutdown().await;
+            logger.flush();
+            return ExitCode::from(EXIT_FATAL);
+        }
+    };
+    let mitm = match MitmState::from_options(&cfg.mitm_options()) {
         Ok(m) => m,
         Err(e) => {
             logger.fatal(format!("MITM setup failed: {e}"));
@@ -112,9 +98,9 @@ pub async fn run(cfg: Config, logger: Logger) -> ExitCode {
     if let Some(m) = &mitm {
         m.cache.set_logger(logger.clone());
     }
-    let (http, socks) = build_engines(&cfg, mitm.as_ref(), &access, &logger);
+    let (http, socks) = build_engines_with(routing, &cfg, mitm.as_ref(), &access, &logger);
     let handlers: Arc<dyn ProtocolHandlers> = Arc::new(EngineHandlers::new(http, socks));
-    let server = match Server::from_config(&cfg, handlers, logger.clone()).await {
+    let server = match Server::from_options(&cfg.server_options(), handlers, logger.clone()).await {
         Ok(s) => s,
         Err(e) => {
             logger.fatal(e);
@@ -160,29 +146,56 @@ pub async fn run(cfg: Config, logger: Logger) -> ExitCode {
     code
 }
 
+/// Compile the engine routing state for `cfg`: a fixed `direct` default with no rules and
+/// upstream TCP keepalive. The destination filter is handed to the direct dialer, which
+/// checks the domain and every resolved IP at dial time (v1.2.0 semantics).
+pub fn routing_state(cfg: &Config) -> Result<SharedRouting, RoutingSetupError> {
+    let dialer = DialerOptions {
+        filter: cfg.host_filter().map(Arc::new),
+        ..DialerOptions::default()
+    };
+    RoutingState::from_input(&cfg.routing_input(), dialer).map(RoutingState::shared)
+}
+
 /// Build the HTTP and SOCKS engines, enabling destination filtering when `--allow`/`--block`
 /// is configured, HTTPS interception when `mitm` is present, and the SOCKS web guard when
 /// additionally `--socks-block-web-in-mitm` is set.
+///
+/// # Panics
+///
+/// If the direct-only routing state fails to compile, which a validated [`Config`] cannot
+/// cause (it declares no profiles and no rules); [`run`] reports such errors via
+/// [`routing_state`] instead.
 pub fn build_engines(
     cfg: &Config,
     mitm: Option<&MitmState>,
     access: &AccessLogger,
     logger: &Logger,
 ) -> (HttpProxy, SocksProxy) {
-    let filter = cfg.host_filter().map(Arc::new);
-    let keepalive = cfg.tcp_keepalive_settings();
-    let mut http = HttpProxy::new(access.clone(), logger.clone()).with_tcp_keepalive(keepalive);
-    let mut socks = SocksProxy::new(access.clone(), logger.clone()).with_tcp_keepalive(keepalive);
-    if let Some(f) = &filter {
+    let routing = routing_state(cfg).expect("direct-only routing state always compiles");
+    build_engines_with(routing, cfg, mitm, access, logger)
+}
+
+/// Like [`build_engines`], over an already compiled routing state.
+pub fn build_engines_with(
+    routing: SharedRouting,
+    cfg: &Config,
+    mitm: Option<&MitmState>,
+    access: &AccessLogger,
+    logger: &Logger,
+) -> (HttpProxy, SocksProxy) {
+    if let Some(f) = cfg.host_filter() {
         logger.info(format!(
             "destination filter enabled: {} ({} rule{})",
             f.mode_str(),
             f.len(),
             if f.len() == 1 { "" } else { "s" }
         ));
-        http = http.with_filter(Arc::clone(f));
-        socks = socks.with_filter(Arc::clone(f));
     }
+    // rusty-conduit has no routing rules: keep the v1.2.0 access-record shape (no `rule`,
+    // `profile`, or `upstream` fields).
+    let access = access.clone().with_routing_fields(false);
+    let mut engines = EngineHandlers::from_routing(routing, access, logger.clone());
     if let Some(m) = mitm {
         logger.info(format!(
             "MITM enabled: CA \"{}\" valid until {}; leaf certificate TTL {}",
@@ -190,17 +203,15 @@ pub fn build_engines(
             logging::format_timestamp(m.ca_not_after),
             humantime::format_duration(cfg.mitm_cert_ttl)
         ));
-        let mut interceptor = m.interceptor.clone().with_tcp_keepalive(keepalive);
-        if let Some(f) = &filter {
-            interceptor = interceptor.with_filter(Arc::clone(f));
-        }
-        http = http.with_mitm(Arc::new(interceptor));
         if cfg.socks_block_web_in_mitm {
             logger.info("SOCKS web blocking enabled: HTTP/HTTPS over SOCKS is rejected");
-            socks = socks.with_guard(Arc::new(socks::web_guard::WebGuard));
         }
+        engines = engines.with_mitm(Arc::new(m.interceptor.clone()), cfg.socks_block_web_in_mitm);
     }
-    (http, socks)
+    (
+        engines.http_engine().clone(),
+        engines.socks_engine().clone(),
+    )
 }
 
 /// Resolve when the process receives `Ctrl+C` (all platforms) or `SIGTERM` (Unix).
@@ -270,9 +281,8 @@ pub fn main_entry() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::test_support::{capture_access, quiet_logger, Buf};
     use crate::server::ListenPlan;
-    use crate::socks::test_support::{echo_roundtrip, spawn_echo};
+    use crate::test_support::{capture_access, echo_roundtrip, quiet_logger, spawn_echo, Buf};
 
     use std::net::SocketAddr;
 
@@ -344,9 +354,10 @@ mod tests {
 
     async fn engine_server(plan: ListenPlan) -> (Server, Buf) {
         let (access, log) = capture_access().await;
+        let routing = routing_state(&Config::default()).unwrap();
         let handlers: Arc<dyn ProtocolHandlers> = Arc::new(EngineHandlers::new(
-            HttpProxy::new(access.clone(), quiet_logger()),
-            SocksProxy::new(access, quiet_logger()),
+            HttpProxy::new(Arc::clone(&routing), access.clone(), quiet_logger()),
+            SocksProxy::new(routing, access, quiet_logger()),
         ));
         let server = Server::bind(plan, handlers, quiet_logger()).await.unwrap();
         (server, log)
@@ -428,8 +439,9 @@ mod tests {
     /// MITM wiring through `build_engines` + the real server on a multiplexed port.
     #[tokio::test]
     async fn mitm_active_through_server_wiring() {
-        use crate::http::mitm_tunnel::{client_config_with_roots, test_support as mt};
-        use crate::mitm::ca::test_support::test_ca;
+        use crate::http::mitm_tunnel::client_config_with_roots;
+        use crate::test_support as mt;
+        use crate::test_support::test_ca;
         use http_body_util::BodyExt;
 
         let origin = mt::spawn_origin().await;
@@ -448,7 +460,13 @@ mod tests {
         roots.add(origin.ca_der.clone()).unwrap();
         let provider = crate::mitm::crypto_provider();
         let upstream = client_config_with_roots(provider.clone(), roots).unwrap();
-        let state = MitmState::build(&cfg, &cfg.ca_source().unwrap(), provider, upstream).unwrap();
+        let state = MitmState::build(
+            &cfg.mitm_options(),
+            &cfg.ca_source().unwrap(),
+            provider,
+            upstream,
+        )
+        .unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
 
         let (access, log) = capture_access().await;
@@ -502,7 +520,7 @@ mod tests {
     #[tokio::test]
     async fn socks_web_guard_installed_only_with_mitm_and_flag() {
         use crate::http::mitm_tunnel::client_config_with_roots;
-        use crate::mitm::ca::test_support::test_ca;
+        use crate::test_support::test_ca;
 
         let dir = std::env::temp_dir().join(format!("rc-lib-guard-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -519,7 +537,13 @@ mod tests {
         let provider = crate::mitm::crypto_provider();
         let upstream =
             client_config_with_roots(provider.clone(), rustls::RootCertStore::empty()).unwrap();
-        let state = MitmState::build(&cfg, &cfg.ca_source().unwrap(), provider, upstream).unwrap();
+        let state = MitmState::build(
+            &cfg.mitm_options(),
+            &cfg.ca_source().unwrap(),
+            provider,
+            upstream,
+        )
+        .unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         let (access, _log) = capture_access().await;
         let logger = quiet_logger();

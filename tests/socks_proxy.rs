@@ -113,7 +113,15 @@ impl SocksServer {
             let provider = crypto_provider();
             let upstream =
                 client_config_with_roots(Arc::clone(&provider), RootCertStore::empty()).unwrap();
-            Some(MitmState::build(&cfg, &cfg.ca_source().unwrap(), provider, upstream).unwrap())
+            Some(
+                MitmState::build(
+                    &cfg.mitm_options(),
+                    &cfg.ca_source().unwrap(),
+                    provider,
+                    upstream,
+                )
+                .unwrap(),
+            )
         } else {
             None
         };
