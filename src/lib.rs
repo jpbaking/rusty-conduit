@@ -203,10 +203,11 @@ pub fn build_engines_with(
             logging::format_timestamp(m.ca_not_after),
             humantime::format_duration(cfg.mitm_cert_ttl)
         ));
-        if cfg.socks_block_web_in_mitm {
-            logger.info("SOCKS web blocking enabled: HTTP/HTTPS over SOCKS is rejected");
-        }
-        engines = engines.with_mitm(Arc::new(m.interceptor.clone()), cfg.socks_block_web_in_mitm);
+        engines = engines.with_mitm(Arc::new(m.interceptor.clone()), false);
+    }
+    if cfg.socks_block_web_in_mitm {
+        logger.info("SOCKS web blocking enabled: HTTP/HTTPS over SOCKS is rejected");
+        engines = engines.with_socks_block_web();
     }
     (
         engines.http_engine().clone(),
@@ -518,7 +519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn socks_web_guard_installed_only_with_mitm_and_flag() {
+    async fn socks_web_guard_installed_with_or_without_mitm() {
         use crate::http::mitm_tunnel::client_config_with_roots;
         use crate::test_support::test_ca;
 
@@ -557,7 +558,11 @@ mod tests {
         let (h, s) = build_engines(&cfg, Some(&state), &access, &logger);
         assert_eq!(guarded(&h, &s), (true, true));
         let (h, s) = build_engines(&cfg, None, &access, &logger);
-        assert_eq!(guarded(&h, &s), (false, false), "MITM off: flag inactive");
+        assert_eq!(
+            guarded(&h, &s),
+            (false, true),
+            "MITM off: SOCKS web guard still active when flag is set"
+        );
         cfg.socks_block_web_in_mitm = false;
         let (h, s) = build_engines(&cfg, Some(&state), &access, &logger);
         assert_eq!(guarded(&h, &s), (true, false));

@@ -80,8 +80,6 @@ pub enum ConfigError {
     },
     #[error("invalid TCP keepalive setting: {0}")]
     InvalidKeepalive(String),
-    #[error("conflicting destination filter: cannot set both allowlist and blocklist")]
-    ConflictingFilter,
 }
 
 /// Raw command-line / environment input (`clap` derive with `env` fallbacks).
@@ -136,7 +134,8 @@ pub struct CliArgs {
     #[arg(long, value_name = "N", env = "RUSTY_CONDUIT_TCP_KEEPALIVE_RETRIES")]
     pub tcp_keepalive_retries: Option<u32>,
 
-    /// Allowlist of destinations (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated
+    /// Allowlist of destinations (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated.
+    /// When combined with --block, serves as exceptions to the blocklist.
     #[arg(
         long,
         value_name = "RULE",
@@ -145,7 +144,8 @@ pub struct CliArgs {
     )]
     pub allow: Vec<FilterRule>,
 
-    /// Blocklist of destinations (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated
+    /// Blocklist of destinations (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated.
+    /// Combine with --allow to carve out exceptions.
     #[arg(
         long,
         value_name = "RULE",
@@ -200,9 +200,19 @@ pub struct CliArgs {
     )]
     pub mitm_cert_cache_max_entries: Option<usize>,
 
-    /// When MITM is ON, reject HTTP/HTTPS traffic over SOCKS4/5
+    /// Reject HTTP/HTTPS traffic over SOCKS4/5 (works with or without MITM)
     #[arg(
         long,
+        env = "RUSTY_CONDUIT_SOCKS_BLOCK_WEB",
+        action = ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub socks_block_web: bool,
+
+    /// Backwards-compatible alias for --socks-block-web
+    #[arg(
+        long = "socks-block-web-in-mitm",
+        hide = true,
         env = "RUSTY_CONDUIT_SOCKS_BLOCK_WEB_IN_MITM",
         action = ArgAction::SetTrue,
         value_parser = clap::builder::BoolishValueParser::new()
@@ -232,8 +242,10 @@ pub struct CliInput {
     pub args: CliArgs,
     /// `--mitm-ca-passphrase` came from an actual command-line argument (not the env var).
     pub passphrase_from_cli: bool,
-    /// `--socks-block-web-in-mitm` was explicitly provided (CLI or env), so it overrides TOML.
+    /// `--socks-block-web` (or alias `--socks-block-web-in-mitm`) was explicitly provided (CLI or env).
     pub socks_block_web_explicit: bool,
+    /// Resolved CLI/env value for `--socks-block-web` when `socks_block_web_explicit` is true.
+    pub socks_block_web_value: bool,
 }
 
 impl CliInput {
@@ -257,14 +269,20 @@ impl CliInput {
         let args = CliArgs::from_arg_matches(matches)?;
         let passphrase_from_cli =
             matches.value_source("mitm_ca_passphrase") == Some(ValueSource::CommandLine);
-        let socks_block_web_explicit = matches!(
-            matches.value_source("socks_block_web_in_mitm"),
-            Some(ValueSource::CommandLine | ValueSource::EnvVariable)
-        );
+        let primary_src = matches.value_source("socks_block_web");
+        let legacy_src = matches.value_source("socks_block_web_in_mitm");
+        let (socks_block_web_explicit, socks_block_web_value) = match (primary_src, legacy_src) {
+            (Some(ValueSource::CommandLine), _) => (true, args.socks_block_web),
+            (_, Some(ValueSource::CommandLine)) => (true, args.socks_block_web_in_mitm),
+            (Some(ValueSource::EnvVariable), _) => (true, args.socks_block_web),
+            (_, Some(ValueSource::EnvVariable)) => (true, args.socks_block_web_in_mitm),
+            _ => (false, false),
+        };
         Ok(Self {
             args,
             passphrase_from_cli,
             socks_block_web_explicit,
+            socks_block_web_value,
         })
     }
 }
@@ -284,6 +302,8 @@ pub struct FileConfig {
     pub tcp_keepalive_retries: Option<u32>,
     pub allow: Option<Vec<String>>,
     pub block: Option<Vec<String>>,
+    /// Reject HTTP/HTTPS traffic over SOCKS4/5 (works with or without MITM).
+    pub socks_block_web: Option<bool>,
     #[serde(default)]
     pub mitm: FileMitmConfig,
     #[serde(default)]
@@ -488,10 +508,10 @@ impl Config {
             .transpose()?;
 
         let socks_block_web_in_mitm = if cli.socks_block_web_explicit {
-            a.socks_block_web_in_mitm
+            cli.socks_block_web_value
         } else {
-            file.mitm
-                .socks_block_web
+            file.socks_block_web
+                .or(file.mitm.socks_block_web)
                 .unwrap_or(d.socks_block_web_in_mitm)
         };
         let file_allow = file_filter_rules("allow", file.allow)?;
@@ -567,9 +587,6 @@ impl Config {
         if self.mitm_cert_ttl < MIN_MITM_CERT_TTL {
             return Err(ConfigError::CertTtlTooShort(self.mitm_cert_ttl));
         }
-        if !self.allow.is_empty() && !self.block.is_empty() {
-            return Err(ConfigError::ConflictingFilter);
-        }
         if !self.tcp_keepalive.is_zero() {
             let secs = Duration::from_secs(1)..=MAX_TCP_KEEPALIVE_DURATION;
             let fmt = |d: Duration| humantime::format_duration(d).to_string();
@@ -608,13 +625,7 @@ impl Config {
 
     /// The configured destination filter, or `None` when unfiltered.
     pub fn host_filter(&self) -> Option<HostFilter> {
-        if !self.allow.is_empty() {
-            Some(HostFilter::Allow(self.allow.clone()))
-        } else if !self.block.is_empty() {
-            Some(HostFilter::Block(self.block.clone()))
-        } else {
-            None
-        }
+        HostFilter::from_lists(self.allow.clone(), self.block.clone())
     }
 
     /// Engine routing input: the fixed `direct` default with no rules and no profiles,
@@ -683,11 +694,6 @@ impl Config {
         !self.bind.is_loopback()
     }
 
-    /// `--socks-block-web-in-mitm` is set but has no effect because MITM is OFF.
-    pub fn socks_block_web_inactive(&self) -> bool {
-        self.socks_block_web_in_mitm && !self.mitm_enabled()
-    }
-
     /// Resolve the CA passphrase from the inline value or the passphrase file
     /// (trailing `\n` / `\r\n` trimmed).
     pub fn resolve_passphrase(&self) -> Result<Option<String>, ConfigError> {
@@ -726,13 +732,6 @@ impl Config {
                 "NOTICE: --mitm-ca-passphrase was passed on the command line, where it may be \
                  visible to other users and shell history; prefer RUSTY_CONDUIT_MITM_CA_PASSPHRASE \
                  or --mitm-ca-passphrase-file"
-                    .to_string(),
-            );
-        }
-        if self.socks_block_web_inactive() {
-            out.push(
-                "NOTICE: --socks-block-web-in-mitm is inactive because MITM is disabled \
-                 (no CA configured)"
                     .to_string(),
             );
         }
@@ -853,6 +852,7 @@ mod tests {
         "RUSTY_CONDUIT_MITM_CA_PASSPHRASE",
         "RUSTY_CONDUIT_MITM_CA_PASSPHRASE_FILE",
         "RUSTY_CONDUIT_MITM_CERT_TTL",
+        "RUSTY_CONDUIT_SOCKS_BLOCK_WEB",
         "RUSTY_CONDUIT_SOCKS_BLOCK_WEB_IN_MITM",
         "RUSTY_CONDUIT_LOG_LEVEL",
         "RUSTY_CONDUIT_LOG_FORMAT",
@@ -1064,6 +1064,12 @@ socks_log = "/file/socks.log"
 
     #[test]
     fn socks_block_web_flag_and_env() {
+        let _env = EnvGuard::new(&[("RUSTY_CONDUIT_SOCKS_BLOCK_WEB", "true")]);
+        let c = cli(&[]);
+        assert!(c.socks_block_web_explicit);
+        assert!(Config::merge(c, None).unwrap().socks_block_web_in_mitm);
+        drop(_env);
+
         let _env = EnvGuard::new(&[("RUSTY_CONDUIT_SOCKS_BLOCK_WEB_IN_MITM", "true")]);
         let c = cli(&[]);
         assert!(c.socks_block_web_explicit);
@@ -1071,6 +1077,10 @@ socks_log = "/file/socks.log"
         drop(_env);
 
         let _env = EnvGuard::new(&[]);
+        let c = cli(&["--socks-block-web"]);
+        assert!(c.socks_block_web_explicit);
+        assert!(Config::merge(c, None).unwrap().socks_block_web_in_mitm);
+
         let c = cli(&["--socks-block-web-in-mitm"]);
         assert!(c.socks_block_web_explicit);
         assert!(Config::merge(c, None).unwrap().socks_block_web_in_mitm);
@@ -1078,6 +1088,16 @@ socks_log = "/file/socks.log"
         let c = cli(&[]);
         assert!(!c.socks_block_web_explicit);
         let file = FileConfig {
+            socks_block_web: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            Config::merge(c.clone(), Some(file))
+                .unwrap()
+                .socks_block_web_in_mitm
+        );
+
+        let legacy_file = FileConfig {
             mitm: FileMitmConfig {
                 socks_block_web: Some(true),
                 ..Default::default()
@@ -1085,7 +1105,7 @@ socks_log = "/file/socks.log"
             ..Default::default()
         };
         assert!(
-            Config::merge(c, Some(file))
+            Config::merge(c, Some(legacy_file))
                 .unwrap()
                 .socks_block_web_in_mitm
         );
@@ -1286,14 +1306,14 @@ socks_log = "/file/socks.log"
     }
 
     #[test]
-    fn notice_socks_block_web_without_mitm() {
+    fn socks_block_web_works_without_mitm_no_inactive_notice() {
         let _env = EnvGuard::new(&[]);
-        let cfg = load(&["--socks-block-web-in-mitm"]).unwrap();
-        assert!(cfg.socks_block_web_inactive());
-        assert!(cfg.notices().iter().any(|n| n.contains("inactive")));
+        let cfg = load(&["--socks-block-web"]).unwrap();
+        assert!(cfg.socks_block_web_in_mitm);
+        assert!(cfg.notices().is_empty());
 
-        let cfg = load(&["--socks-block-web-in-mitm", "--mitm-ca-p12", "a.p12"]).unwrap();
-        assert!(!cfg.socks_block_web_inactive());
+        let cfg = load(&["--socks-block-web-in-mitm"]).unwrap();
+        assert!(cfg.socks_block_web_in_mitm);
         assert!(cfg.notices().is_empty());
     }
 
@@ -1436,9 +1456,13 @@ socks_log = "/file/socks.log"
         let s = cfg.summary();
         assert!(s.contains("filter=allow(3)"), "{s}");
 
-        // Mutual exclusion: allow + block
-        let err = load(&["--allow", "example.com", "--block", "127.0.0.1"]).unwrap_err();
-        assert!(matches!(err, ConfigError::ConflictingFilter), "{err:?}");
+        // Combined allow + block: allowlist serves as exceptions to blocklist
+        let cfg = load(&["--allow", "test.domain.net", "--block", "*.domain.net"]).unwrap();
+        assert!(matches!(
+            cfg.host_filter(),
+            Some(HostFilter::BlockExcept { .. })
+        ));
+        assert!(cfg.summary().contains("filter=block-except(2)"));
 
         // TOML parsing
         let toml_path = temp_file(
@@ -1450,15 +1474,18 @@ allow = ["example.com", "192.168.0.0/16"]
         assert_eq!(cfg.allow.len(), 2);
         assert!(cfg.block.is_empty());
 
-        // Cross-source conflict (TOML allow + CLI block) is rejected
-        let err = load(&[
+        // Cross-source combination (TOML allow + CLI block) produces BlockExcept
+        let cfg = load(&[
             "--config",
             toml_path.to_str().unwrap(),
             "--block",
             "10.0.0.0/8",
         ])
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::ConflictingFilter), "{err:?}");
+        .unwrap();
+        assert!(matches!(
+            cfg.host_filter(),
+            Some(HostFilter::BlockExcept { .. })
+        ));
 
         // Env var override
         drop(_env);

@@ -125,11 +125,6 @@ impl SocksServer {
         } else {
             None
         };
-        assert_eq!(
-            cfg.socks_block_web_inactive(),
-            mode == Mode::FlagWithoutMitm
-        );
-
         let logger = quiet_logger();
         let access = AccessLogger::start(
             AccessLogConfig::new(LogLevel::Info, cfg.log_format, None, cfg.socks_log.clone()),
@@ -657,18 +652,24 @@ async fn block_web_allows_raw_tcp_and_server_speaks_first() {
 }
 
 #[tokio::test]
-async fn block_web_flag_is_inactive_without_mitm() {
+async fn block_web_flag_is_active_without_mitm() {
     let up = echo().await;
-    let proxy = SocksServer::start("flag-inactive", LogFormat::Text, Mode::FlagWithoutMitm).await;
+    let proxy = SocksServer::start("flag-without-mitm", LogFormat::Text, Mode::FlagWithoutMitm).await;
 
     let (mut s, rep) = socks5(proxy.addr, 1, Addr::V4([127, 0, 0, 1]), up.addr.port()).await;
     assert_eq!(rep, 0x00);
     let req = b"GET / HTTP/1.1\r\nHost: example\r\n\r\n";
-    assert_eq!(roundtrip(&mut s, req).await, req);
+    s.write_all(req).await.unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    assert!(buf.is_empty(), "blocked HTTP request must receive no reply");
     drop(s);
 
     let lines = proxy.wait_log_lines(1).await;
-    assert!(lines[0].contains("status=ok"), "{lines:?}");
-    assert_eq!(up.received.load(Ordering::SeqCst), req.len());
+    assert!(
+        lines[0].contains("status=blocked_web_in_mitm"),
+        "{lines:?}"
+    );
+    assert_eq!(up.received.load(Ordering::SeqCst), 0);
     proxy.stop().await;
 }
