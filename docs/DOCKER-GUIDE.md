@@ -21,7 +21,7 @@ The examples were tested with Docker Engine 29.9 and Docker Compose 5.7 on Docke
 | **Ports** | `3128` (HTTP/HTTPS) and `1080` (SOCKS4/4a/5) |
 | **Environment** | `RUSTY_CONDUIT_BIND=0.0.0.0`, so the listeners accept connections forwarded by Docker, and `MALLOC_ARENA_MAX=2`, which keeps memory low on hosts with many CPUs |
 
-Pin a major tag such as `:1` so you get fixes and features within that major version, but not breaking changes. To build the image yourself from a clone of the repository:
+Pin a major tag such as `:2` so you get fixes and features within that major version, but not breaking changes. To build the image yourself from a clone of the repository:
 
 ```sh
 docker build -t rusty-conduit .
@@ -35,10 +35,10 @@ docker build -t rusty-conduit .
 docker run -d --name rusty-conduit --restart unless-stopped \
   -p 127.0.0.1:3128:3128 \
   -p 127.0.0.1:1080:1080 \
-  ghcr.io/jpbaking/rusty-conduit:1
+  ghcr.io/jpbaking/rusty-conduit:2
 ```
 
-- **Publish on `127.0.0.1`.** Inside the container the proxy listens on `0.0.0.0`, so the `SECURITY NOTICE` at startup is expected. What decides who can reach it is the host side of `-p`: `-p 3128:3128` without an address exposes the proxy to your network, and v1 has **no proxy authentication**.
+- **Publish on `127.0.0.1`.** Inside the container the proxy listens on `0.0.0.0`, so the `SECURITY NOTICE` at startup is expected. What decides who can reach it is the host side of `-p`: `-p 3128:3128` without an address exposes the proxy to your network, and there is **no proxy authentication**.
 - **Flags and environment variables** work as usual: put flags after the image name, or pass `-e RUSTY_CONDUIT_*` variables.
 - **Memory:** the image sets `MALLOC_ARENA_MAX=2`, which keeps memory low on hosts with many CPUs. Leave it in place unless you measure otherwise; see [Performance, Footprint & Sizing](PERFORMANCE-AND-SIZING.md#memory-on-many-core-linux-malloc_arena_max).
 - **Logs:** `docker logs -f rusty-conduit`.
@@ -49,7 +49,7 @@ Serve HTTP, HTTPS, and SOCKS on one port:
 ```sh
 docker run -d --name rusty-conduit \
   -p 127.0.0.1:8888:8888 \
-  ghcr.io/jpbaking/rusty-conduit:1 --http-port 8888 --socks-port 8888
+  ghcr.io/jpbaking/rusty-conduit:2 --http-port 8888 --socks-port 8888
 ```
 
 
@@ -73,14 +73,14 @@ Mount a **directory** read-only and point `--config` at the file inside it:
 docker run -d --name rusty-conduit \
   -p 127.0.0.1:3128:3128 -p 127.0.0.1:1080:1080 \
   -v "$PWD/conf:/etc/rusty-conduit:ro" \
-  ghcr.io/jpbaking/rusty-conduit:1 --config /etc/rusty-conduit/rusty-conduit.toml
+  ghcr.io/jpbaking/rusty-conduit:2 --config /etc/rusty-conduit/rusty-conduit.toml
 ```
 
 Check it before starting:
 
 ```sh
 docker run --rm -v "$PWD/conf:/etc/rusty-conduit:ro" \
-  ghcr.io/jpbaking/rusty-conduit:1 validate --config /etc/rusty-conduit/rusty-conduit.toml
+  ghcr.io/jpbaking/rusty-conduit:2 validate --config /etc/rusty-conduit/rusty-conduit.toml
 # config OK: /etc/rusty-conduit/rusty-conduit.toml
 ```
 
@@ -104,7 +104,7 @@ docker logs rusty-conduit 2>/dev/null   # access and SOCKS records only
 docker run -d --name rusty-conduit \
   -p 127.0.0.1:3128:3128 -p 127.0.0.1:1080:1080 \
   -v rusty-conduit-logs:/var/log/rusty-conduit \
-  ghcr.io/jpbaking/rusty-conduit:1 \
+  ghcr.io/jpbaking/rusty-conduit:2 \
   --http-access-log /var/log/rusty-conduit/access.log \
   --socks-log /var/log/rusty-conduit/socks.log
 
@@ -124,7 +124,7 @@ MITM needs a CA you create yourself; see the [MITM CA Guide](MITM-CA-GUIDE.md). 
 docker run -d --name rusty-conduit \
   -p 127.0.0.1:3128:3128 -p 127.0.0.1:1080:1080 \
   -v "$PWD/ca:/etc/rusty-conduit/ca:ro" \
-  ghcr.io/jpbaking/rusty-conduit:1 \
+  ghcr.io/jpbaking/rusty-conduit:2 \
   --mitm-ca-cert /etc/rusty-conduit/ca/ca.pem \
   --mitm-ca-key /etc/rusty-conduit/ca/ca.key
 ```
@@ -157,7 +157,7 @@ docker run -d --name rusty-conduit \
   -p 127.0.0.1:3128:3128 -p 127.0.0.1:1080:1080 \
   --health-cmd 'bash -c "exec 3<>/dev/tcp/127.0.0.1/3128"' \
   --health-interval 30s --health-timeout 3s --health-retries 3 \
-  ghcr.io/jpbaking/rusty-conduit:1
+  ghcr.io/jpbaking/rusty-conduit:2
 ```
 
 The check passes while the HTTP listener accepts connections. If you disable the HTTP port, check the SOCKS port instead.
@@ -172,7 +172,7 @@ The proxy writes nothing except the log files you configure, and needs no Linux 
 docker run -d --name rusty-conduit \
   -p 127.0.0.1:3128:3128 -p 127.0.0.1:1080:1080 \
   --read-only --cap-drop ALL --security-opt no-new-privileges:true \
-  ghcr.io/jpbaking/rusty-conduit:1
+  ghcr.io/jpbaking/rusty-conduit:2
 ```
 
 Keep the published ports on `127.0.0.1`, or behind a firewall, until proxy authentication exists.
@@ -194,7 +194,7 @@ docker compose down
 ```yaml
 services:
   rusty-conduit:
-    image: ghcr.io/jpbaking/rusty-conduit:1
+    image: ghcr.io/jpbaking/rusty-conduit:2
     restart: unless-stopped
     ports:
       - "127.0.0.1:3128:3128"
@@ -232,7 +232,7 @@ socks_log = "/var/log/rusty-conduit/socks.log"
 ```yaml
 services:
   rusty-conduit:
-    image: ghcr.io/jpbaking/rusty-conduit:1
+    image: ghcr.io/jpbaking/rusty-conduit:2
     restart: unless-stopped
     command: ["--config", "/etc/rusty-conduit/rusty-conduit.toml"]
     ports:
@@ -278,7 +278,7 @@ Services on the same Compose network reach the proxy by its service name. This p
 ```yaml
 services:
   proxy:
-    image: ghcr.io/jpbaking/rusty-conduit:1
+    image: ghcr.io/jpbaking/rusty-conduit:2
     restart: unless-stopped
 
   app:
@@ -302,7 +302,7 @@ Tools differ in which names they read: `curl`, for example, ignores `HTTP_PROXY`
 | :--- | :--- | :--- |
 | `FATAL failed to open access log: ... Permission denied` | The container's UID cannot create files in the log directory | Use a named volume, or a host directory the container's UID can write ([File ownership](#file-ownership-on-linux-hosts)) |
 | `FATAL MITM setup failed: failed to read MITM CA file ...: Permission denied` | The key file is not readable by the container's UID | Run as your own UID, or `sudo chown 10001` the key ([File ownership](#file-ownership-on-linux-hosts)) |
-| Clients on other machines cannot connect | The ports are published on `127.0.0.1` | Publish on a LAN address or `0.0.0.0` only behind a firewall: v1 has no proxy authentication |
+| Clients on other machines cannot connect | The ports are published on `127.0.0.1` | Publish on a LAN address or `0.0.0.0` only behind a firewall: there is no proxy authentication |
 | `SECURITY NOTICE: binding to non-loopback address 0.0.0.0` at startup | Expected: the proxy listens on all interfaces inside the container | Control exposure with the host side of `-p` |
 | Memory is much higher than the sizing guide says | `MALLOC_ARENA_MAX` was overridden or unset, so glibc allocates a memory arena per worker thread | Keep the image default, `MALLOC_ARENA_MAX=2` ([section 6](#6-resource-limits)) |
 | `docker: Error response from daemon: ... Bind for 127.0.0.1:3128 failed` | Another process on the host uses the port | Change the host side only, for example `-p 127.0.0.1:8080:3128` |

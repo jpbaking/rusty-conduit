@@ -25,7 +25,7 @@ Extract it and place `rusty-conduit` (or `rusty-conduit.exe`) somewhere on your 
 Multi-arch images (`linux/amd64` and `linux/arm64`, based on Ubuntu 26.04 LTS) are published to GitHub Container Registry on each release:
 
 ```sh
-# Publish to host loopback only (recommended — v1 has no proxy authentication)
+# Publish to host loopback only (recommended: there is no proxy authentication)
 docker run --rm \
   -p 127.0.0.1:3128:3128 \
   -p 127.0.0.1:1080:1080 \
@@ -174,7 +174,7 @@ rusty-conduit --allow example.com,*.example.org
 rusty-conduit --bind 0.0.0.0
 ```
 
-> **Note:** v1 has **no proxy authentication**. Binding to a non-loopback address prints a security notice at startup — restrict access with your firewall and keep `--max-connections` bounded (see [Performance, Footprint & Sizing](PERFORMANCE-AND-SIZING.md)).
+> **Note:** There is **no proxy authentication**. Binding to a non-loopback address prints a security notice at startup — restrict access with your firewall and keep `--max-connections` bounded (see [Performance, Footprint & Sizing](PERFORMANCE-AND-SIZING.md)).
 
 ### Check a configuration before starting
 

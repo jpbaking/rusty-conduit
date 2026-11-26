@@ -27,7 +27,7 @@ Download a prebuilt package for Linux, macOS, or Windows (`amd64` / `arm64`) fro
 
 ```sh
 # Docker (multi-arch: linux/amd64, linux/arm64); see the Docker Guide for Compose
-docker run --rm -p 127.0.0.1:3128:3128 -p 127.0.0.1:1080:1080 ghcr.io/jpbaking/rusty-conduit:1
+docker run --rm -p 127.0.0.1:3128:3128 -p 127.0.0.1:1080:1080 ghcr.io/jpbaking/rusty-conduit:2
 
 # Or build from source
 cargo install --path .

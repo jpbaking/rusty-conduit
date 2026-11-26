@@ -99,7 +99,7 @@ rusty-conduit --config /etc/rusty-conduit/rusty-conduit.toml --http-port 8080
 - Port bind failure or unopenable log file path.
 
 **`INFO` startup notices:**
-- Binding to a non-loopback IP (reminds that v1 has no proxy authentication).
+- Binding to a non-loopback IP (reminds that there is no proxy authentication).
 - Passing `--mitm-ca-passphrase` as a CLI argument (recommends env var or passphrase file).
 
 ### Checking a configuration
@@ -231,9 +231,9 @@ To keep that state alive, rusty-conduit enables OS-level **TCP keepalive** on ev
 - For SSH through SOCKS, also set `ServerAliveInterval` (e.g. `30`) in `~/.ssh/config`. It works end to end inside the encrypted session.
 - Set `--tcp-keepalive 0` to disable. On platforms without per-socket interval/retry control, only the idle time is applied.
 
-## 6. Protocol Matrix (v1)
+## 6. Protocol Matrix
 
-| Protocol | Supported | Not in v1 (see [TODO](TODO.md)) |
+| Protocol | Supported | Not supported yet (see [TODO](TODO.md)) |
 | :--- | :--- | :--- |
 | HTTP proxy | Absolute-form `http://` forwarding (RFC 9110 hop-by-hop stripping), `CONNECT` tunnels, optional HTTPS MITM (HTTP/1.1, HTTP/2, `101` upgrades) | `Proxy-Authorization` |
 | SOCKS4 / 4a | `CONNECT` (IPv4 + proxy-resolved domains); user ID logged as metadata | `BIND` (rejected `0x5B`) |

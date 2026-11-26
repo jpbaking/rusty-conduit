@@ -1,6 +1,6 @@
 # TODO
 
-Features not yet in `rusty-conduit`. The [Advanced User Guide](USER-GUIDE-ADVANCED.md#6-protocol-matrix-v1) lists what each protocol supports today.
+Features not yet in `rusty-conduit`. The [Advanced User Guide](USER-GUIDE-ADVANCED.md#6-protocol-matrix) lists what each protocol supports today.
 
 ## 1. Proxy authentication
 - **HTTP/HTTPS:** `Proxy-Authorization: Basic` (RFC 7235 / 9110) with `407 Proxy Authentication Required` challenges.
