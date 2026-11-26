@@ -39,7 +39,8 @@ This guide covers:
   credentials, session tokens, and personal data. Protect `--http-access-log` files accordingly.
 - **Some applications pin certificates** (banking apps, OS update services, and some
   messengers). They refuse intercepted connections. v1 cannot bypass MITM for specific
-  domains; for those clients, use a proxy without MITM, or SOCKS.
+  domains; for those clients, use a proxy without MITM, or SOCKS (unless you enable
+  `--socks-block-web`).
 - **v1 has no proxy authentication.** Keep `--bind` on loopback (the default), or restrict
   access with a firewall.
 
@@ -294,14 +295,16 @@ keytool -importcert -noprompt -alias rusty-conduit-ca -file ca.pem -cacerts -sto
 
 ### 4.6 Verifying interception
 
-Start rusty-conduit with MITM and an access log, then send a request through it that trusts
-only your CA:
+Start rusty-conduit with MITM at `--log-level DEBUG`, which prints each access record on `stdout`,
+then send a request through it that trusts only your CA:
 
 ```sh
-rusty-conduit --mitm-ca-cert ca.pem --mitm-ca-key ca.key --http-access-log access.log &
-curl -sS -o /dev/null -w '%{http_code}\n' -x http://127.0.0.1:3128 --cacert ca.pem https://example.com/
-tail -n1 access.log
+rusty-conduit --mitm-ca-cert ca.pem --mitm-ca-key ca.key --log-level DEBUG 2>/dev/null &
+curl -sS -o /dev/null -w '%{http_code}
+' -x http://127.0.0.1:3128 --cacert ca.pem https://example.com/
+# 200
 # ts=… kind=http client=127.0.0.1:… proto=https mitm=true method=GET target=https://example.com/ status=200 …
+kill %1
 ```
 
 If the client reports an unknown issuer, the CA is not trusted in that client's store.

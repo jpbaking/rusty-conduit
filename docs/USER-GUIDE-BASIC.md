@@ -4,6 +4,7 @@ This guide gets you up and running with `rusty-conduit` for everyday local and h
 
 - Looking for TOML configs, MITM inspection, web-blocking over SOCKS, or JSON log pipelines? See the **[Advanced User Guide](USER-GUIDE-ADVANCED.md)**.
 - Curious about RAM, CPU, or `ulimit -n` sizing? See **[Performance, Footprint & Sizing](PERFORMANCE-AND-SIZING.md)**.
+- Running in Docker or Compose? See the **[Docker Guide](DOCKER-GUIDE.md)**.
 
 ---
 
@@ -39,6 +40,8 @@ docker run --rm \
   ghcr.io/jpbaking/rusty-conduit:latest \
   --http-port 8888 --socks-port 8888 --log-level DEBUG
 ```
+
+The **[Docker Guide](DOCKER-GUIDE.md)** covers config files, logs, MITM, resource limits, and Compose examples.
 
 ### Option C: Build from source
 
@@ -186,3 +189,4 @@ rusty-conduit validate --config proxy.toml
 - **[Advanced User Guide](USER-GUIDE-ADVANCED.md):** TOML config files, environment variables, HTTPS MITM inspection, `--socks-block-web`, JSON logs, and full CLI reference.
 - **[MITM CA Guide](MITM-CA-GUIDE.md):** Step-by-step instructions to generate and trust your own private CA.
 - **[Performance, Footprint & Sizing](PERFORMANCE-AND-SIZING.md):** Memory/CPU budgets, `ulimit -n` math, and connection/cache caps.
+- **[Docker Guide](DOCKER-GUIDE.md):** Running in containers, with `docker run` and Compose examples.

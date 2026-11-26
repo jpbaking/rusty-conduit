@@ -2,7 +2,7 @@
 
 This guide documents `rusty-conduit`'s memory, CPU, file-descriptor, and listen-backlog characteristics, along with sizing rules of thumb and how its resource caps behave under load.
 
-- Back to [README](../README.md) · [Basic User Guide](USER-GUIDE-BASIC.md) · [Advanced User Guide](USER-GUIDE-ADVANCED.md)
+- Back to [README](../README.md) · [Basic User Guide](USER-GUIDE-BASIC.md) · [Advanced User Guide](USER-GUIDE-ADVANCED.md) · [Docker Guide](DOCKER-GUIDE.md)
 
 ---
 
@@ -26,7 +26,7 @@ The **measured** figures come from a release build on 64-bit Linux using idle `C
 
 | Workload / Component | RAM | CPU | Basis |
 | :--- | :--- | :--- | :--- |
-| Idle process | ~6 MB RSS | ~0% (event-driven) | Measured (`5.8 MB`) |
+| Idle process | ~6 MB RSS on 1–2 CPUs; more on many-core Linux (see below) | ~0% (event-driven) | Measured (`5.8 MB`) |
 | Opaque tunnel (`CONNECT` or SOCKS) | ~25 KB / connection | Low (streaming byte copy; multi-Gbps per core) | Measured for `CONNECT` (`23.7 KB`); SOCKS estimated |
 | Plain HTTP request | ~25–50 KB while active | Low (HTTP/1.1 header parsing + streaming) | Estimated |
 | HTTPS MITM tunnel | ~50–150 KB / tunnel | Moderate–High (**2× TLS** via `ring` assembly AES-GCM/ChaCha20 + HTTP/1.1 or HTTP/2 framing) | Estimated |
@@ -35,6 +35,18 @@ The **measured** figures come from a release build on 64-bit Linux using idle `C
 - The Tokio async runtime spawns one worker thread per CPU core.
 - Throughput is typically network-bound for opaque tunnels and plain HTTP, and CPU-bound (double TLS) in MITM mode.
 - The background MITM cert-cache reaper wakes once every `clamp(ttl / 4, 5s, 60s)` (once per minute at the default `1h` TTL) with negligible CPU overhead.
+
+### Memory on many-core Linux (`MALLOC_ARENA_MAX`)
+
+On Linux, the prebuilt binaries and the container image use glibc's `malloc`, which gives each worker thread its own memory arena. On a host with many CPUs, that multiplies both idle and per-connection memory. Measured with the container image (Linux arm64, 1,000 idle `CONNECT` tunnels after 1 KiB each):
+
+| Setting | Idle RSS | Per open tunnel |
+| :--- | :--- | :--- |
+| glibc defaults, 2 CPUs | ~9 MB | 110–230 KB |
+| glibc defaults, 18 CPUs | ~42 MB | ~220 KB |
+| `MALLOC_ARENA_MAX=2`, 2 or 18 CPUs | ~7 MB | ~26 KB |
+
+The container image sets `MALLOC_ARENA_MAX=2`. For the prebuilt Linux binaries, set it in the environment (for example `Environment=MALLOC_ARENA_MAX=2` in a `systemd` unit) to get the low figures on any CPU count. In the same setup, 64 parallel bulk transfers ran at 2.2–2.7 GB/s with or without it, within run-to-run noise. Fewer worker threads also lower the idle figure: the runtime starts one per CPU it may use, so a Docker `--cpus` limit or `TOKIO_WORKER_THREADS=<n>` reduces them. On macOS, the idle process measured ~8 MB with 18 CPUs.
 
 ---
 
@@ -100,6 +112,8 @@ Assuming a typical active browser holds roughly **10 concurrent TCP connections*
 | Home / small team | `1024` | `2112` | ~35 MB | up to ~200 MB | 25–100 |
 | Default | `4096` | `8256` | ~110 MB | up to ~700 MB | 100–400 |
 | High concurrency (non-MITM) | `16384` | `32832` | ~420 MB | — | 1,000–2,500+ |
+
+The RAM figures assume the low per-tunnel cost (~26 KB). On many-core Linux with glibc defaults, budget up to ~230 KB per open tunnel, or set `MALLOC_ARENA_MAX=2` ([above](#memory-on-many-core-linux-malloc_arena_max)).
 
 ---
 

@@ -15,7 +15,7 @@
 - **Opt-in HTTPS MITM without surprises:** OFF by default and **never auto-generates a CA**. Bring your own PEM or PKCS#12 CA, inspect HTTP/1.1 & HTTP/2 traffic, and optionally block web traffic over SOCKS (`--socks-block-web`).
 - **Destination allowlist / blocklist:** Restrict egress with `--allow` or `--block` (IP, CIDR, exact FQDN, or `*.domain` wildcards), checking both hostnames and resolved IPs before connecting.
 - **Survives long silent connections:** No idle timeout on established tunnels, plus TCP keepalive on client and upstream sockets (default `60s` idle / `10s` × `5` probes) so NAT, firewalls, and VPNs don't drop agents waiting on slow responses.
-- **Built for operators:** `CLI > env > TOML` configuration, 6 diagnostic log levels, structured `text` (logfmt) or `json` (NDJSON) access/SOCKS logs, graceful shutdown draining, and built-in connection & cert-cache caps (~6 MB idle RSS).
+- **Built for operators:** `CLI > env > TOML` configuration, 6 diagnostic log levels, structured `text` (logfmt) or `json` (NDJSON) access/SOCKS logs, graceful shutdown draining, and built-in connection & cert-cache caps, with a small footprint: about 7 MB idle and 26 KB per open tunnel (Linux with `MALLOC_ARENA_MAX=2`, which the container image sets; see [sizing](docs/PERFORMANCE-AND-SIZING.md)).
 
 ---
 
@@ -26,8 +26,8 @@
 Download a prebuilt package for Linux, macOS, or Windows (`amd64` / `arm64`) from **[Releases](https://github.com/jpbaking/rusty-conduit/releases)**, run with Docker, or build from source with Rust:
 
 ```sh
-# Docker (multi-arch: linux/amd64, linux/arm64; binds 0.0.0.0 inside container)
-docker run --rm -p 127.0.0.1:3128:3128 -p 127.0.0.1:1080:1080 ghcr.io/jpbaking/rusty-conduit:latest
+# Docker (multi-arch: linux/amd64, linux/arm64); see the Docker Guide for Compose
+docker run --rm -p 127.0.0.1:3128:3128 -p 127.0.0.1:1080:1080 ghcr.io/jpbaking/rusty-conduit:1
 
 # Or build from source
 cargo install --path .
@@ -64,10 +64,10 @@ rusty-conduit --http-port 8888 --socks-port 8888 --log-level DEBUG
 | :--- | :--- |
 | **[Basic User Guide](docs/USER-GUIDE-BASIC.md)** | Installing, connecting browsers/CLI tools, common flags, single-port mode, and watching logs |
 | **[Advanced User Guide](docs/USER-GUIDE-ADVANCED.md)** | Full CLI/env/TOML reference, HTTPS MITM inspection, `--socks-block-web`, and JSON logging |
-| **[Performance, Footprint & Sizing](docs/PERFORMANCE-AND-SIZING.md)** | CPU/RAM footprint (~6 MB idle, ~25 KB/tunnel), `ulimit -n` math, concurrent user sizing, and resource caps |
 | **[MITM CA Guide](docs/MITM-CA-GUIDE.md)** | Generating your own PEM or PKCS#12 CA with `openssl` and trusting it on Linux, macOS, Windows, and Firefox |
-| **[Master Plan](docs/MASTER-PLAN.md)** | v1 architecture and design specification |
-| **[Future Plans](FUTURE-PLANS.md)** | Post-v1 roadmap (proxy auth, SOCKS5 `UDP ASSOCIATE`, MITM bypass lists, and more) |
+| **[Performance, Footprint & Sizing](docs/PERFORMANCE-AND-SIZING.md)** | Measured CPU/RAM footprint, `ulimit -n` and `somaxconn` limits, concurrent user sizing, and resource caps |
+| **[Docker Guide](docs/DOCKER-GUIDE.md)** | Images, `docker run` and Compose examples, config and log mounts, MITM secrets, limits, health checks, and hardening |
+| **[TODO](docs/TODO.md)** | Planned features (proxy auth, SOCKS5 `UDP ASSOCIATE`, MITM bypass lists, and more) |
 
 ---
 

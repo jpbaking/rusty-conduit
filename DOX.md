@@ -224,7 +224,7 @@ rusty-conduit: a single Rust crate (`Cargo.toml`) producing the `rusty_conduit` 
 - **MITM is opt-in** and never auto-generates a CA; the configuration summary must never contain the CA passphrase.
 - **Pure-Rust TLS.** Keep the dependency tree free of OpenSSL / aws-lc (`rustls` with the `ring` provider).
 - **Tests are hermetic.** Integration tests in `tests/` run a real server on ephemeral loopback ports against local upstreams with in-process ephemeral CAs; they need no external network. Each test file carries its own harness. `src/test_support.rs` holds helpers for the crate's unit tests only (`#[cfg(test)]`).
-- **User-facing docs** live in `README.md`, `docs/`, and `FUTURE-PLANS.md`. Keep them in step with CLI flags, env vars, TOML keys, and defaults when those change.
+- **User-facing docs** live in `README.md` and `docs/` (`USER-GUIDE-BASIC.md`, `USER-GUIDE-ADVANCED.md`, `MITM-CA-GUIDE.md`, `PERFORMANCE-AND-SIZING.md`, `DOCKER-GUIDE.md`, `TODO.md`). Keep them in step with CLI flags, env vars, TOML keys, defaults, and the `Dockerfile` when those change. Release archives ship `README.md`, `LICENSE`, and the whole `docs/` folder.
 
 ### Verification
 
@@ -251,7 +251,7 @@ When the user requests a durable behavior change, record it here or in the relev
 - **Configuration loading and validation** — clap CLI/env flags, TOML file schema, precedence merge, validation, notices, and the redacted config summary; maps settings onto engine options (server, MITM, filter, keepalive, routing input). Start: `src/config.rs`. Files: `Cargo.toml` (clap/serde/toml deps).
 - **Engine wiring** — builds the direct-only routing state with the destination filter on the dialer, then the HTTP and SOCKS engines with optional MITM interception and the SOCKS web guard. Start: `src/lib.rs` (`routing_state`, `build_engines`, `build_engines_with`). Files: `Cargo.toml` (`rusty-conduit-engine` dependency).
 - **HTTP/HTTPS proxy** — plain HTTP forwarding, hop-by-hop header stripping, opaque `CONNECT` tunnels, HTTP access log (`text`/`json`); engine-implemented, configured and verified here. Start: `src/lib.rs`. Files: `src/config.rs`, `tests/http_proxy.rs`.
-- **SOCKS4/4a/5 proxy** — SOCKS `CONNECT`, SOCKS log, and `--socks-block-web-in-mitm`; engine-implemented, configured and verified here. Start: `src/lib.rs`. Files: `src/config.rs`, `tests/socks_proxy.rs`.
+- **SOCKS4/4a/5 proxy** — SOCKS `CONNECT`, SOCKS log, and `--socks-block-web`; engine-implemented, configured and verified here. Start: `src/lib.rs`. Files: `src/config.rs`, `tests/socks_proxy.rs`.
 - **Listener planning and single-port multiplexing** — separate HTTP/SOCKS ports, first-byte multiplexing when the ports are equal, port `0` disables a listener. Start: `src/config.rs` (`server_options`, `is_multiplexed`). Files: `src/lib.rs`, `tests/mux_port.rs`.
 - **HTTPS MITM inspection** — PEM or PKCS#12 CA, passphrase sources, leaf-certificate TTL and cache caps, background reaper. Start: `src/config.rs` (`mitm_options`, `ca_source`, `resolve_passphrase`). Files: `src/lib.rs` (`run`, `build_engines_with`), `tests/mitm_proxy.rs`, `docs/MITM-CA-GUIDE.md`.
 - **Destination allowlist / blocklist** — `--allow` / `--block` rules (IP, CIDR, FQDN, `*.domain`) checked against hostnames and resolved IPs. Start: `src/config.rs` (`host_filter`). Files: `src/lib.rs` (`routing_state`), `tests/filter_proxy.rs`.
@@ -259,7 +259,7 @@ When the user requests a durable behavior change, record it here or in the relev
 - **Graceful shutdown** — `Ctrl+C` / `SIGTERM` cancels the server, drains connections, stops the reaper, and flushes access logs. Start: `src/lib.rs` (`shutdown_signal`, `run`).
 - **Unit-test helpers** — log capture, echo/origin servers, test CA, TLS client for the crate's unit tests. Start: `src/test_support.rs`. Files: `src/lib.rs` (`mod tests`).
 - **Build, packaging, and release** — CI lint/test/Docker build, tag-triggered multi-platform release archives and multi-arch GHCR image. Start: `.github/workflows/release.yml`. Files: `.github/workflows/ci.yml`, `Dockerfile`, `.dockerignore`, `Cargo.lock`.
-- **User documentation** — quick start, user guides, sizing, MITM CA guide, architecture plan, roadmap. Start: `README.md`. Files: `docs/`, `FUTURE-PLANS.md`, `LICENSE`.
+- **User documentation** — marketing README with quick start, basic and advanced user guides, MITM CA guide, sizing, Docker guide, and TODO list. Start: `README.md`. Files: `docs/`, `LICENSE`.
 
 ## Child DOX Index
 

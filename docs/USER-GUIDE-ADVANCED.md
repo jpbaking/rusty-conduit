@@ -5,6 +5,7 @@ This guide covers full configuration precedence, TOML files, HTTPS MITM inspecti
 - New to `rusty-conduit`? Start with the **[Basic User Guide](USER-GUIDE-BASIC.md)**.
 - For RAM/CPU budgets, `ulimit -n` sizing, and cap mechanics, see **[Performance, Footprint & Sizing](PERFORMANCE-AND-SIZING.md)**.
 - For creating and trusting a private CA, see the **[MITM CA Guide](MITM-CA-GUIDE.md)**.
+- For containers and Compose, see the **[Docker Guide](DOCKER-GUIDE.md)**.
 
 ---
 
@@ -38,7 +39,7 @@ Settings are merged in strict order (higher overrides lower):
 | `--mitm-ca-passphrase-file <PATH>` | `RUSTY_CONDUIT_MITM_CA_PASSPHRASE_FILE` | `mitm.ca_passphrase_file` | *(none)* | File containing CA passphrase (trailing `\n`/`\r\n` trimmed) |
 | `--mitm-cert-ttl <DURATION>` | `RUSTY_CONDUIT_MITM_CERT_TTL` | `mitm.cert_ttl` | `1h` | In-memory MITM leaf cert TTL (`humantime`, min `10s`) |
 | `--mitm-cert-cache-max-entries <N>` | `RUSTY_CONDUIT_MITM_CERT_CACHE_MAX_ENTRIES` | `mitm.cert_cache_max_entries` | `10240` | Max cached MITM leaf certs (`0` = unlimited) |
-| `--socks-block-web` | `RUSTY_CONDUIT_SOCKS_BLOCK_WEB` | `socks_block_web` | `false` | Reject HTTP/HTTPS traffic over SOCKS4/4a/5 (works with or without MITM). The old names `--socks-block-web-in-mitm` and `mitm.socks_block_web` still work |
+| `--socks-block-web` | `RUSTY_CONDUIT_SOCKS_BLOCK_WEB` | `socks_block_web` | `false` | Reject HTTP/HTTPS traffic over SOCKS4/4a/5 (works with or without MITM). |
 | `--log-level <LEVEL>` | `RUSTY_CONDUIT_LOG_LEVEL` | `logging.level` | `INFO` | `QUIET`, `FATAL`, `ERROR`, `INFO`, `DEBUG`, `VERBOSE` (case-insensitive) |
 | `--log-format <FMT>` | `RUSTY_CONDUIT_LOG_FORMAT` | `logging.format` | `text` | Access/SOCKS log format: `text` (logfmt) or `json` (NDJSON) |
 | `--http-access-log <PATH>` | `RUSTY_CONDUIT_HTTP_ACCESS_LOG` | `logging.http_access_log` | *(none)* | File path for HTTP/HTTPS access log (append mode) |
@@ -101,16 +102,18 @@ rusty-conduit --config /etc/rusty-conduit/rusty-conduit.toml --http-port 8080
 - Binding to a non-loopback IP (reminds that v1 has no proxy authentication).
 - Passing `--mitm-ca-passphrase` as a CLI argument (recommends env var or passphrase file).
 
-## Checking a configuration
+### Checking a configuration
 
-Use the `validate` subcommand to load, merge, and validate CLI flags, environment variables, and `--config` without binding any listener:
+Use the `validate` subcommand to load, merge, and validate CLI flags, environment variables, and `--config` without binding any listener. Other flags go before the subcommand:
 
 ```sh
 rusty-conduit validate --config proxy.toml
+rusty-conduit --socks-port 0 validate --config proxy.toml
 ```
 
 - On success, it prints `config OK: <path|none>` (followed by any startup `NOTICE:` lines) to `stdout` and exits `0`.
 - On failure, it prints `config invalid: <error>` to `stderr` and exits `1`.
+- It checks settings, not the files they name. An unreadable CA key or log path still passes `validate` and fails at startup.
 
 **Exit codes:** `0` for a clean exit, `1` for a fatal startup or runtime error, and `2` for a command-line usage error.
 
@@ -175,6 +178,8 @@ rusty-conduit \
 
 Diagnostic logs always write to **`stderr`**. Access and SOCKS logs write to their configured files, and at `DEBUG` / `VERBOSE` are **also** copied to **`stdout`** so you can pipe them independently.
 
+Log files are written through a buffer that is flushed whenever no more records are queued, so records reach the file within moments even on a quiet proxy, while bursts are still written in large blocks. Records on `stdout` are written immediately.
+
 | Level | `stderr` (Diagnostics) | Access & SOCKS Logs |
 | :--- | :--- | :--- |
 | `QUIET` | None | Files only (if configured) |
@@ -228,7 +233,7 @@ To keep that state alive, rusty-conduit enables OS-level **TCP keepalive** on ev
 
 ## 6. Protocol Matrix (v1)
 
-| Protocol | Supported | Not in v1 (see [FUTURE-PLANS.md](../FUTURE-PLANS.md)) |
+| Protocol | Supported | Not in v1 (see [TODO](TODO.md)) |
 | :--- | :--- | :--- |
 | HTTP proxy | Absolute-form `http://` forwarding (RFC 9110 hop-by-hop stripping), `CONNECT` tunnels, optional HTTPS MITM (HTTP/1.1, HTTP/2, `101` upgrades) | `Proxy-Authorization` |
 | SOCKS4 / 4a | `CONNECT` (IPv4 + proxy-resolved domains); user ID logged as metadata | `BIND` (rejected `0x5B`) |
