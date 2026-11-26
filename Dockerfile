@@ -22,7 +22,9 @@ RUN apt-get update \
     && apt-get dist-upgrade -y \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin rusty-conduit
+    && groupadd --system --gid 10001 rusty-conduit \
+    && useradd --system --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin rusty-conduit \
+    && install -d -o 10001 -g 10001 -m 0755 /var/log/rusty-conduit
 
 LABEL org.opencontainers.image.title="rusty-conduit" \
       org.opencontainers.image.description="Lightweight HTTP/HTTPS and SOCKS4/4a/5 proxy server with optional HTTPS MITM inspection" \
@@ -31,8 +33,15 @@ LABEL org.opencontainers.image.title="rusty-conduit" \
 
 ENV RUSTY_CONDUIT_BIND=0.0.0.0
 
+# glibc gives every worker thread its own malloc arena, which multiplies memory on hosts with
+# many CPUs (about 8x per open connection); two arenas keep it low with no measurable
+# throughput cost.
+ENV MALLOC_ARENA_MAX=2
+
 EXPOSE 3128 1080
-USER rusty-conduit
+# Numeric, so orchestrators can verify the image never runs as root (Kubernetes
+# runAsNonRoot).
+USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/rusty-conduit"]
 
 # Fast multi-arch packaging target for CI (uses native binaries built in release.yml).
