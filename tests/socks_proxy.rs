@@ -1,6 +1,6 @@
 //! End-to-end tests for the SOCKS engine: SOCKS4, SOCKS4a, SOCKS5 `CONNECT` (IPv4, Domain,
 //! IPv6), unsupported command rejection, the SOCKS log file in `text` and `json` formats, and
-//! `--socks-block-web-in-mitm` (HTTP and HTTPS blocked, raw TCP and server-speaks-first
+//! `--socks-block-web` (HTTP and HTTPS blocked, raw TCP and server-speaks-first
 //! protocols allowed).
 //!
 //! Every test runs a real [`Server`] on an ephemeral loopback port against local upstreams.
@@ -81,9 +81,9 @@ fn write_test_ca(dir: &Path) -> (PathBuf, PathBuf) {
 enum Mode {
     /// MITM OFF (plain transparent SOCKS).
     Plain,
-    /// MITM OFF but `--socks-block-web-in-mitm` set (flag must be inactive).
+    /// MITM OFF but `--socks-block-web` set (flag must be inactive).
     FlagWithoutMitm,
-    /// MITM ON + `--socks-block-web-in-mitm`.
+    /// MITM ON + `--socks-block-web`.
     BlockWeb,
 }
 
@@ -103,7 +103,7 @@ impl SocksServer {
         let mut cfg = Config {
             log_format: format,
             socks_log: Some(log_path.clone()),
-            socks_block_web_in_mitm: mode != Mode::Plain,
+            socks_block_web: mode != Mode::Plain,
             ..Config::default()
         };
         let state = if mode == Mode::BlockWeb {
@@ -537,7 +537,7 @@ async fn socks_log_file_json_format() {
 }
 
 // ---------------------------------------------------------------------------
-// --socks-block-web-in-mitm
+// --socks-block-web
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

@@ -162,7 +162,7 @@ pub fn routing_state(cfg: &Config) -> Result<SharedRouting, RoutingSetupError> {
 
 /// Build the HTTP and SOCKS engines, enabling destination filtering when `--allow`/`--block`
 /// is configured, HTTPS interception when `mitm` is present, and the SOCKS web guard when
-/// additionally `--socks-block-web-in-mitm` is set.
+/// additionally `--socks-block-web` is set.
 ///
 /// # Panics
 ///
@@ -208,7 +208,7 @@ pub fn build_engines_with(
         ));
         engines = engines.with_mitm(Arc::new(m.interceptor.clone()), false);
     }
-    if cfg.socks_block_web_in_mitm {
+    if cfg.socks_block_web {
         logger.info("SOCKS web blocking enabled: HTTP/HTTPS over SOCKS is rejected");
         engines = engines.with_socks_block_web();
     }
@@ -564,7 +564,7 @@ mod tests {
         let mut cfg = Config {
             mitm_ca_cert: Some(cert),
             mitm_ca_key: Some(key),
-            socks_block_web_in_mitm: true,
+            socks_block_web: true,
             ..Config::default()
         };
         let provider = crate::mitm::crypto_provider();
@@ -595,7 +595,7 @@ mod tests {
             (false, true),
             "MITM off: SOCKS web guard still active when flag is set"
         );
-        cfg.socks_block_web_in_mitm = false;
+        cfg.socks_block_web = false;
         let (h, s) = build_engines(&cfg, Some(&state), &access, &logger);
         assert_eq!(guarded(&h, &s), (true, false));
     }
