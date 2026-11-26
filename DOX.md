@@ -245,7 +245,7 @@ When the user requests a durable behavior change, record it here or in the relev
 ## Feature Map
 
 - **CLI entrypoint and process lifecycle** — parses args/env, dispatches `validate`, loads and validates config, starts the Tokio runtime, logs the startup banner, runs the server, and exits with `FATAL` code `1` on startup errors. Start: `src/main.rs`. Files: `src/lib.rs` (`main_entry`, `load_config`, `log_startup`, `run`).
-- **`validate` subcommand** — loads and validates the configuration without binding listeners and exits 0/1. Start: `src/lib.rs` (`cmd_validate`). Files: `src/config.rs` (`Command`), `tests/validate_cmd.rs`.
+- **`validate` subcommand** — loads and validates the configuration, then runs the offline pre-flight checks (MITM CA, log paths, open-file limit) unless `--settings-only`, without binding listeners, and exits 0/1. Start: `src/lib.rs` (`cmd_validate`, `preflight_checks`). Files: `src/preflight.rs`. Files: `src/config.rs` (`Command`), `tests/validate_cmd.rs`.
 - **Open-file limit** — raises the soft `RLIMIT_NOFILE` at startup and logs a NOTICE when it cannot hold `--max-connections`. Start: `src/fdlimit.rs`. Files: `src/lib.rs` (`run`), `Cargo.toml` (`rlimit`), `docs/PERFORMANCE-AND-SIZING.md`.
 - **CLI family contract** — test that shared flags keep the family's names, value names, env vars, help text, and defaults. Start: `tests/cli_contract.rs`.
 - **Configuration loading and validation** — clap CLI/env flags, TOML file schema, precedence merge, validation, notices, and the redacted config summary; maps settings onto engine options (server, MITM, filter, keepalive, routing input). Start: `src/config.rs`. Files: `Cargo.toml` (clap/serde/toml deps).

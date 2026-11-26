@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod fdlimit;
+pub mod preflight;
 #[cfg(test)]
 mod test_support;
 
@@ -255,10 +256,37 @@ pub async fn shutdown_signal(logger: &Logger) {
     }
 }
 
-/// `validate`: exit 0 when the configuration is valid, 1 otherwise.
+/// The offline checks startup would fail on (see [`preflight`]), in startup order.
+pub fn preflight_checks(cfg: &Config) -> Result<(), String> {
+    if let Some(path) = &cfg.http_access_log {
+        preflight::check_log_path("--http-access-log", path)?;
+    }
+    if let Some(path) = &cfg.socks_log {
+        preflight::check_log_path("--socks-log", path)?;
+    }
+    routing_state(cfg).map_err(|e| e.to_string())?;
+    preflight::check_mitm(&cfg.mitm_options())
+}
+
+/// `validate [--settings-only]`: exit 0 when the configuration is valid, 1 otherwise.
+///
+/// Without `--settings-only`, it also runs the [`preflight_checks`] and reports the
+/// open-file limit as startup would.
 pub fn cmd_validate(cli: CliInput, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    let settings_only = matches!(
+        cli.args.command,
+        Some(Command::Validate {
+            settings_only: true
+        })
+    );
     match load_config(cli) {
         Ok(cfg) => {
+            if !settings_only {
+                if let Err(e) = preflight_checks(&cfg) {
+                    let _ = writeln!(err, "config invalid: {e}");
+                    return EXIT_FATAL;
+                }
+            }
             let path = cfg
                 .config_path
                 .as_ref()
@@ -267,6 +295,13 @@ pub fn cmd_validate(cli: CliInput, out: &mut dyn Write, err: &mut dyn Write) -> 
             let _ = writeln!(out, "config OK: {path}");
             for notice in cfg.notices() {
                 let _ = writeln!(out, "{notice}");
+            }
+            if !settings_only {
+                if let Some(notice) =
+                    preflight::fd_limit_notice(cfg.max_connections, "--max-connections")
+                {
+                    let _ = writeln!(out, "{notice}");
+                }
             }
             0
         }
@@ -281,7 +316,7 @@ pub fn cmd_validate(cli: CliInput, out: &mut dyn Write, err: &mut dyn Write) -> 
 /// load and validate config, then run on a multi-threaded Tokio runtime.
 pub fn main_entry() -> ExitCode {
     let cli = CliInput::parse();
-    if cli.args.command == Some(Command::Validate) {
+    if matches!(cli.args.command, Some(Command::Validate { .. })) {
         return ExitCode::from(cmd_validate(
             cli,
             &mut std::io::stdout(),

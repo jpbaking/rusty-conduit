@@ -85,8 +85,14 @@ pub enum ConfigError {
 /// Subcommands. Without one, the proxy runs.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
-    /// Validate the configuration (flags, environment, and --config file) and exit 0/1
-    Validate,
+    /// Validate the configuration (flags, environment, and --config file) and the files it
+    /// names (MITM CA, log paths), then exit 0/1
+    Validate {
+        /// Check the settings only; skip the files they name (for checking a config away from
+        /// the host it runs on)
+        #[arg(long)]
+        settings_only: bool,
+    },
 }
 
 /// Raw command-line / environment input (`clap` derive with `env` fallbacks).

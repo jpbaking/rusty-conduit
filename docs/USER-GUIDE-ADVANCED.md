@@ -113,7 +113,8 @@ rusty-conduit --socks-port 0 validate --config proxy.toml
 
 - On success, it prints `config OK: <path|none>` (followed by any startup `NOTICE:` lines) to `stdout` and exits `0`.
 - On failure, it prints `config invalid: <error>` to `stderr` and exits `1`.
-- It checks settings, not the files they name. An unreadable CA key or log path still passes `validate` and fails at startup.
+- It also checks the files the configuration names, as startup would: it loads the MITM CA (files, passphrase, validity, and that the key matches the certificate) and checks that each log file can be opened, without creating it. It prints the open-file `NOTICE` startup would log, too.
+- `--settings-only` skips those file checks, for checking a config away from the host it runs on, for example in CI where the CA exists only on the server: `rusty-conduit validate --settings-only --config proxy.toml`.
 
 **Exit codes:** `0` for a clean exit, `1` for a fatal startup or runtime error, and `2` for a command-line usage error.
 

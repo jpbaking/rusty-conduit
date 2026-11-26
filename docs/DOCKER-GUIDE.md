@@ -42,6 +42,7 @@ docker run -d --name rusty-conduit --restart unless-stopped \
 - **Flags and environment variables** work as usual: put flags after the image name, or pass `-e RUSTY_CONDUIT_*` variables.
 - **Memory:** the image sets `MALLOC_ARENA_MAX=2`, which keeps memory low on hosts with many CPUs. Leave it in place unless you measure otherwise; see [Performance, Footprint & Sizing](PERFORMANCE-AND-SIZING.md#memory-on-many-core-linux-malloc_arena_max).
 - **Logs:** `docker logs -f rusty-conduit`.
+- **While you set things up**, use `--restart on-failure:5` instead of `unless-stopped`. A broken configuration then stops after five failed starts instead of restarting forever; switch to `unless-stopped` once it runs.
 - **Stop:** `docker stop rusty-conduit` sends `SIGTERM`. Active connections drain for up to 5 seconds, well inside Docker's default 10-second grace period.
 
 Serve HTTP, HTTPS, and SOCKS on one port:
@@ -84,7 +85,7 @@ docker run --rm -v "$PWD/conf:/etc/rusty-conduit:ro" \
 # config OK: /etc/rusty-conduit/rusty-conduit.toml
 ```
 
-`validate` checks the settings, not the files they name: an unreadable CA key or log directory still passes, and fails only when the proxy starts. Environment variables override the file as usual, for example `-e RUSTY_CONDUIT_LOG_LEVEL=DEBUG`. See the [Advanced User Guide](USER-GUIDE-ADVANCED.md) for every key.
+`validate` also checks the files the config names, from inside the container, so run it with the same mounts as the proxy. To check only the settings, for example before the CA is mounted, add `--settings-only`. Environment variables override the file as usual, for example `-e RUSTY_CONDUIT_LOG_LEVEL=DEBUG`. See the [Advanced User Guide](USER-GUIDE-ADVANCED.md) for every key.
 
 ---
 

@@ -74,3 +74,36 @@ fn unknown_flag_exits_two() {
     let (code, _, _) = run(&["--no-such-flag"]);
     assert_eq!(code, Some(2));
 }
+
+#[test]
+fn validate_checks_the_mitm_ca_files_unless_settings_only() {
+    let ca = [
+        "--mitm-ca-cert",
+        "/nonexistent/ca.pem",
+        "--mitm-ca-key",
+        "/nonexistent/ca.key",
+    ];
+    let (code, out, err) = run(&[&ca[..], &["validate"]].concat());
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        err.starts_with("config invalid: MITM setup failed:"),
+        "{err}"
+    );
+
+    let (code, out, err) = run(&[&ca[..], &["validate", "--settings-only"]].concat());
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.starts_with("config OK: none"), "{out}");
+}
+
+#[test]
+fn validate_checks_log_paths_unless_settings_only() {
+    let log = "/nonexistent-rusty-conduit-dir/access.log";
+    let (code, _, err) = run(&["--http-access-log", log, "validate"]);
+    assert_eq!(code, Some(1));
+    assert!(
+        err.starts_with("config invalid: cannot create --http-access-log /nonexistent-rusty-conduit-dir/access.log"),
+        "{err}"
+    );
+    let (code, _, err) = run(&["--http-access-log", log, "validate", "--settings-only"]);
+    assert_eq!(code, Some(0), "{err}");
+}
