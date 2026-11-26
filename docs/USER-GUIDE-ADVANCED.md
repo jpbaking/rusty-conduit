@@ -29,16 +29,16 @@ Settings are merged in strict order (higher overrides lower):
 | `--tcp-keepalive <DURATION>` | `RUSTY_CONDUIT_TCP_KEEPALIVE` | `tcp_keepalive` | `60s` | Idle time before TCP keepalive probes start on client and upstream sockets (`0` disables; `1s`–`32767s`) |
 | `--tcp-keepalive-interval <DURATION>` | `RUSTY_CONDUIT_TCP_KEEPALIVE_INTERVAL` | `tcp_keepalive_interval` | `10s` | Time between unanswered keepalive probes (`1s`–`32767s`) |
 | `--tcp-keepalive-retries <N>` | `RUSTY_CONDUIT_TCP_KEEPALIVE_RETRIES` | `tcp_keepalive_retries` | `5` | Unanswered probes before the OS closes the connection (`1`–`127`) |
-| `--allow <RULE>` | `RUSTY_CONDUIT_ALLOW` | `allow` | *(none)* | Destination allowlist (IP, CIDR, FQDN, or `*.domain`); mutually exclusive with `--block` |
-| `--block <RULE>` | `RUSTY_CONDUIT_BLOCK` | `block` | *(none)* | Destination blocklist (IP, CIDR, FQDN, or `*.domain`); mutually exclusive with `--allow` |
+| `--allow <RULE>` | `RUSTY_CONDUIT_ALLOW` | `allow` | *(none)* | Destination allowlist (IP, CIDR, FQDN, or `*.domain`); when combined with `--block`, serves as exceptions to the blocklist |
+| `--block <RULE>` | `RUSTY_CONDUIT_BLOCK` | `block` | *(none)* | Destination blocklist (IP, CIDR, FQDN, or `*.domain`); combine with `--allow` to carve out exceptions |
 | `--mitm-ca-cert <PATH>` | `RUSTY_CONDUIT_MITM_CA_CERT` | `mitm.ca_cert` | *(none)* | PEM CA certificate (enables MITM with `--mitm-ca-key`) |
 | `--mitm-ca-key <PATH>` | `RUSTY_CONDUIT_MITM_CA_KEY` | `mitm.ca_key` | *(none)* | PEM CA private key (PKCS#8, PKCS#1 RSA, SEC1 EC, or encrypted PKCS#8) |
 | `--mitm-ca-p12 <PATH>` | `RUSTY_CONDUIT_MITM_CA_P12` | `mitm.ca_p12` | *(none)* | PKCS#12 (`.p12`/`.pfx`) CA bundle (enables MITM) |
 | `--mitm-ca-passphrase <STR>` | `RUSTY_CONDUIT_MITM_CA_PASSPHRASE` | `mitm.ca_passphrase` | *(none)* | CA passphrase *(prefer env var or passphrase file)* |
 | `--mitm-ca-passphrase-file <PATH>` | `RUSTY_CONDUIT_MITM_CA_PASSPHRASE_FILE` | `mitm.ca_passphrase_file` | *(none)* | File containing CA passphrase (trailing `\n`/`\r\n` trimmed) |
 | `--mitm-cert-ttl <DURATION>` | `RUSTY_CONDUIT_MITM_CERT_TTL` | `mitm.cert_ttl` | `1h` | In-memory MITM leaf cert TTL (`humantime`, min `10s`) |
-| `--mitm-cert-cache-max-entries <N>` | `RUSTY_CONDUIT_MITM_CERT_CACHE_MAX_ENTRIES` | `mitm.cert_cache_max_entries` | `10000` | Max cached MITM leaf certs (`0` = unlimited) |
-| `--socks-block-web-in-mitm` | `RUSTY_CONDUIT_SOCKS_BLOCK_WEB_IN_MITM` | `mitm.socks_block_web` | `false` | Reject HTTP/HTTPS traffic over SOCKS when MITM is enabled |
+| `--mitm-cert-cache-max-entries <N>` | `RUSTY_CONDUIT_MITM_CERT_CACHE_MAX_ENTRIES` | `mitm.cert_cache_max_entries` | `10240` | Max cached MITM leaf certs (`0` = unlimited) |
+| `--socks-block-web` | `RUSTY_CONDUIT_SOCKS_BLOCK_WEB` | `socks_block_web` | `false` | Reject HTTP/HTTPS traffic over SOCKS4/4a/5 (works with or without MITM). The old names `--socks-block-web-in-mitm` and `mitm.socks_block_web` still work |
 | `--log-level <LEVEL>` | `RUSTY_CONDUIT_LOG_LEVEL` | `logging.level` | `INFO` | `QUIET`, `FATAL`, `ERROR`, `INFO`, `DEBUG`, `VERBOSE` (case-insensitive) |
 | `--log-format <FMT>` | `RUSTY_CONDUIT_LOG_FORMAT` | `logging.format` | `text` | Access/SOCKS log format: `text` (logfmt) or `json` (NDJSON) |
 | `--http-access-log <PATH>` | `RUSTY_CONDUIT_HTTP_ACCESS_LOG` | `logging.http_access_log` | *(none)* | File path for HTTP/HTTPS access log (append mode) |
@@ -55,9 +55,10 @@ max_connections = 4096
 tcp_keepalive = "60s"          # "0" disables
 tcp_keepalive_interval = "10s"
 tcp_keepalive_retries = 5
-# Optional destination filter — set EITHER `allow` OR `block`, never both:
+# Optional destination filter — combine `block` with `allow` to carve out exceptions:
 # block = ["127.0.0.0/8", "::1", "10.0.0.0/8", "*.internal"]
 # allow = ["example.com", "*.example.org", "203.0.113.0/24"]
+socks_block_web = true
 
 [mitm]
 # Use EITHER a PEM pair...
@@ -67,8 +68,7 @@ ca_key  = "/etc/rusty-conduit/ca.enc.key"
 # ca_p12 = "/etc/rusty-conduit/ca.p12"
 ca_passphrase_file = "/etc/rusty-conduit/ca.pass"
 cert_ttl = "30m"
-cert_cache_max_entries = 10000
-socks_block_web = true
+cert_cache_max_entries = 10240
 
 [logging]
 level = "INFO"
@@ -89,7 +89,6 @@ rusty-conduit --config /etc/rusty-conduit/rusty-conduit.toml --http-port 8080
 
 **Fatal startup errors (exit code `1`):**
 - Both `http_port` and `socks_port` are `0`.
-- Supplying both `--allow` and `--block` (including across CLI/env and TOML).
 - Mixing `--mitm-ca-p12` with `--mitm-ca-cert` or `--mitm-ca-key`.
 - Supplying only one of `--mitm-ca-cert` or `--mitm-ca-key`.
 - Supplying both `--mitm-ca-passphrase` and `--mitm-ca-passphrase-file`.
@@ -101,7 +100,19 @@ rusty-conduit --config /etc/rusty-conduit/rusty-conduit.toml --http-port 8080
 **`INFO` startup notices:**
 - Binding to a non-loopback IP (reminds that v1 has no proxy authentication).
 - Passing `--mitm-ca-passphrase` as a CLI argument (recommends env var or passphrase file).
-- Setting `--socks-block-web-in-mitm` while MITM is OFF (flag is inactive).
+
+## Checking a configuration
+
+Use the `validate` subcommand to load, merge, and validate CLI flags, environment variables, and `--config` without binding any listener:
+
+```sh
+rusty-conduit validate --config proxy.toml
+```
+
+- On success, it prints `config OK: <path|none>` (followed by any startup `NOTICE:` lines) to `stdout` and exits `0`.
+- On failure, it prints `config invalid: <error>` to `stderr` and exits `1`.
+
+**Exit codes:** `0` for a clean exit, `1` for a fatal startup or runtime error, and `2` for a command-line usage error.
 
 ---
 
@@ -136,15 +147,15 @@ RUSTY_CONDUIT_MITM_CA_PASSPHRASE='...' rusty-conduit \
 
 ---
 
-## 3. Blocking Web Traffic over SOCKS in MITM Mode
+## 3. Blocking Web Traffic over SOCKS
 
-When MITM is enabled, clients could otherwise bypass HTTPS logging by sending web traffic over SOCKS. Enable `--socks-block-web-in-mitm` to prevent that:
+Clients could otherwise bypass HTTPS logging by sending web traffic over SOCKS. Enable `--socks-block-web` to prevent that (it also works without MITM):
 
 ```sh
 rusty-conduit \
   --mitm-ca-cert ca.pem \
   --mitm-ca-key ca.key \
-  --socks-block-web-in-mitm \
+  --socks-block-web \
   --http-access-log access.log \
   --socks-log socks.log
 ```

@@ -16,7 +16,7 @@ This guide documents `rusty-conduit`'s memory, CPU, and file-descriptor characte
 | DNS lookups | **Never.** Every upstream dial resolves via the OS resolver. |
 | Upstream TCP/TLS connections | **Never pooled across clients.** |
 | Request / response bodies | **Never buffered in full.** Streamed frame by frame. |
-| MITM leaf certificates | **Yes — the only cache.** Bounded by `--mitm-cert-ttl` (default `1h`) and `--mitm-cert-cache-max-entries` (default `10000`). |
+| MITM leaf certificates | **Yes — the only cache.** Bounded by `--mitm-cert-ttl` (default `1h`) and `--mitm-cert-cache-max-entries` (default `10240`). |
 
 ---
 
@@ -30,7 +30,7 @@ The **measured** figures come from a release build on 64-bit Linux using idle `C
 | Opaque tunnel (`CONNECT` or SOCKS) | ~25 KB / connection | Low (streaming byte copy; multi-Gbps per core) | Measured for `CONNECT` (`23.7 KB`); SOCKS estimated |
 | Plain HTTP request | ~25–50 KB while active | Low (HTTP/1.1 header parsing + streaming) | Estimated |
 | HTTPS MITM tunnel | ~50–150 KB / tunnel | Moderate–High (**2× TLS** via `ring` assembly AES-GCM/ChaCha20 + HTTP/1.1 or HTTP/2 framing) | Estimated |
-| Cached MITM leaf certificate | ~3–5 KB / host (~30–50 MB at default `10000` cap) | ~0.2–0.5 ms per cache miss (ECDSA P-256 via `rcgen`, offloaded to blocking pool with single-flight dedup) | Estimated |
+| Cached MITM leaf certificate | ~3–5 KB / host (~30–50 MB at default `10240` cap) | ~0.2–0.5 ms per cache miss (ECDSA P-256 via `rcgen`, offloaded to blocking pool with single-flight dedup) | Estimated |
 
 - The Tokio async runtime spawns one worker thread per CPU core.
 - Throughput is typically network-bound for opaque tunnels and plain HTTP, and CPU-bound (double TLS) in MITM mode.
@@ -48,7 +48,9 @@ Size your process file-descriptor limit using:
 ulimit -n  >=  (2 × max_connections) + 64
 ```
 
-The default `--max-connections 4096` requires at least **`8256`** file descriptors. Many Linux shells default to `1024` (~480 concurrent connections), so either raise `ulimit -n` or lower `--max-connections`:
+On Unix, `rusty-conduit` automatically raises its soft open-file limit (`RLIMIT_NOFILE`) toward the hard limit at startup whenever the current soft limit is below that value, logging the raise at `DEBUG`. If the hard limit is still too low to hold `--max-connections`, it logs `NOTICE: open-file limit is …` at `INFO`.
+
+The default `--max-connections 4096` requires at least **`8256`** file descriptors. Many Linux shells default to `1024` (~480 concurrent connections), so if the hard limit is also too low, either raise `ulimit -n` or lower `--max-connections`:
 
 ```sh
 # Option A: raise FD limit to match default cap
@@ -82,7 +84,7 @@ Assuming a typical active browser holds roughly **10 concurrent TCP connections*
 - Uses a non-blocking semaphore (`try_acquire_owned()`). When the cap is reached, new incoming connections are **accepted and closed immediately** (no reply, no queue, no slowloris buildup) and logged at `DEBUG`.
 - Existing connections are unaffected, and a slot is freed immediately when any connection or tunnel ends.
 
-### `--mitm-cert-cache-max-entries` (default `10000`, `0` = unlimited)
+### `--mitm-cert-cache-max-entries` (default `10240`, `0` = unlimited)
 - Strictly bounds the number of in-memory MITM leaf certificates.
 - When a new hostname is signed at the cap:
   1. Already-expired entries are reaped first so live certificates are not evicted unnecessarily.

@@ -7,16 +7,18 @@
 //! fixed `direct` route and no routing rules.
 
 pub mod config;
+pub mod fdlimit;
 #[cfg(test)]
 mod test_support;
 
 pub use rusty_conduit_engine::{filter, http, logging, mitm, mux, net, routing, server, socks};
 pub use server::EngineHandlers;
 
+use std::io::Write;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use config::{CliInput, Config};
+use config::{CliInput, Command, Config};
 use http::HttpProxy;
 use logging::{AccessLogConfig, AccessLogger, LogLevel, Logger};
 use mitm::MitmState;
@@ -57,6 +59,7 @@ pub fn log_startup(cfg: &Config, logger: &Logger) {
 /// Must be called inside a Tokio runtime.
 pub async fn run(cfg: Config, logger: Logger) -> ExitCode {
     log_startup(&cfg, &logger);
+    fdlimit::apply(&logger, cfg.max_connections, "--max-connections");
 
     let access = match AccessLogger::start(
         AccessLogConfig::new(
@@ -252,10 +255,39 @@ pub async fn shutdown_signal(logger: &Logger) {
     }
 }
 
+/// `validate`: exit 0 when the configuration is valid, 1 otherwise.
+pub fn cmd_validate(cli: CliInput, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    match load_config(cli) {
+        Ok(cfg) => {
+            let path = cfg
+                .config_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let _ = writeln!(out, "config OK: {path}");
+            for notice in cfg.notices() {
+                let _ = writeln!(out, "{notice}");
+            }
+            0
+        }
+        Err((e, _)) => {
+            let _ = writeln!(err, "config invalid: {e}");
+            EXIT_FATAL
+        }
+    }
+}
+
 /// Full CLI entrypoint: parse args/env (help/version/usage errors exit inside `clap`),
 /// load and validate config, then run on a multi-threaded Tokio runtime.
 pub fn main_entry() -> ExitCode {
     let cli = CliInput::parse();
+    if cli.args.command == Some(Command::Validate) {
+        return ExitCode::from(cmd_validate(
+            cli,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        ));
+    }
     let cfg = match load_config(cli) {
         Ok(cfg) => cfg,
         Err((e, level)) => {

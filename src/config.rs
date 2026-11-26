@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::parser::ValueSource;
-use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser};
+use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::Deserialize;
 
 use crate::filter::{FilterRule, HostFilter};
@@ -30,7 +30,7 @@ use crate::server::ServerOptions;
 pub const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// Default HTTP/HTTPS proxy port.
 pub const DEFAULT_HTTP_PORT: u16 = 3128;
-/// Default SOCKS4/5 proxy port.
+/// Default SOCKS4/4a/5 proxy port.
 pub const DEFAULT_SOCKS_PORT: u16 = 1080;
 /// Default in-memory TTL for generated MITM leaf certificates.
 pub const DEFAULT_MITM_CERT_TTL: Duration = Duration::from_secs(60 * 60);
@@ -43,7 +43,7 @@ pub const MAX_TCP_KEEPALIVE_DURATION: Duration = Duration::from_secs(32_767);
 /// Largest accepted TCP keepalive probe count (Linux caps `TCP_KEEPCNT` at 127).
 pub const MAX_TCP_KEEPALIVE_RETRIES: u32 = 127;
 /// Default cap on cached MITM leaf certificates (`0` = unlimited).
-pub const DEFAULT_MITM_CERT_CACHE_MAX_ENTRIES: usize = 10_000;
+pub const DEFAULT_MITM_CERT_CACHE_MAX_ENTRIES: usize = 10_240;
 
 /// Errors raised while loading or validating configuration. Every variant is `FATAL`.
 #[derive(Debug, thiserror::Error)]
@@ -82,6 +82,13 @@ pub enum ConfigError {
     InvalidKeepalive(String),
 }
 
+/// Subcommands. Without one, the proxy runs.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum Command {
+    /// Validate the configuration (flags, environment, and --config file) and exit 0/1
+    Validate,
+}
+
 /// Raw command-line / environment input (`clap` derive with `env` fallbacks).
 #[derive(Debug, Clone, Default, Parser)]
 #[command(
@@ -92,8 +99,11 @@ pub enum ConfigError {
                   Precedence: CLI flags > RUSTY_CONDUIT_* environment variables > --config TOML file > defaults."
 )]
 pub struct CliArgs {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Optional TOML configuration file path
-    #[arg(long, value_name = "PATH", env = "RUSTY_CONDUIT_CONFIG")]
+    #[arg(long, value_name = "PATH", env = "RUSTY_CONDUIT_CONFIG", global = true)]
     pub config: Option<PathBuf>,
 
     /// IPv4 or IPv6 address to bind listeners to [default: 127.0.0.1]
@@ -104,7 +114,7 @@ pub struct CliArgs {
     #[arg(long, value_name = "PORT", env = "RUSTY_CONDUIT_HTTP_PORT")]
     pub http_port: Option<u16>,
 
-    /// SOCKS4/5 proxy port, 0 to disable [default: 1080]
+    /// SOCKS4/4a/5 proxy port, 0 to disable [default: 1080]
     #[arg(long, value_name = "PORT", env = "RUSTY_CONDUIT_SOCKS_PORT")]
     pub socks_port: Option<u16>,
 
@@ -192,7 +202,7 @@ pub struct CliArgs {
     )]
     pub mitm_cert_ttl: Option<Duration>,
 
-    /// Maximum cached MITM leaf certificates; expired then oldest entries are evicted, 0 = unlimited [default: 10000]
+    /// Maximum cached MITM leaf certificates; expired then oldest entries are evicted, 0 = unlimited [default: 10240]
     #[arg(
         long,
         value_name = "N",
@@ -200,7 +210,7 @@ pub struct CliArgs {
     )]
     pub mitm_cert_cache_max_entries: Option<usize>,
 
-    /// Reject HTTP/HTTPS traffic over SOCKS4/5 (works with or without MITM)
+    /// Reject HTTP/HTTPS traffic over SOCKS4/4a/5 (works with or without MITM)
     #[arg(
         long,
         env = "RUSTY_CONDUIT_SOCKS_BLOCK_WEB",
@@ -231,7 +241,7 @@ pub struct CliArgs {
     #[arg(long, value_name = "PATH", env = "RUSTY_CONDUIT_HTTP_ACCESS_LOG")]
     pub http_access_log: Option<PathBuf>,
 
-    /// Optional file path for SOCKS4/5 connection logs
+    /// Optional file path for SOCKS4/4a/5 connection logs
     #[arg(long, value_name = "PATH", env = "RUSTY_CONDUIT_SOCKS_LOG")]
     pub socks_log: Option<PathBuf>,
 }
@@ -302,7 +312,7 @@ pub struct FileConfig {
     pub tcp_keepalive_retries: Option<u32>,
     pub allow: Option<Vec<String>>,
     pub block: Option<Vec<String>>,
-    /// Reject HTTP/HTTPS traffic over SOCKS4/5 (works with or without MITM).
+    /// Reject HTTP/HTTPS traffic over SOCKS4/4a/5 (works with or without MITM).
     pub socks_block_web: Option<bool>,
     #[serde(default)]
     pub mitm: FileMitmConfig,
@@ -372,9 +382,9 @@ pub struct Config {
     pub tcp_keepalive_interval: Duration,
     /// Unanswered TCP keepalive probes before the OS closes the connection.
     pub tcp_keepalive_retries: u32,
-    /// Destination allowlist rules (mutually exclusive with `block`).
+    /// Destination allowlist rules (exceptions to `block` when both are set).
     pub allow: Vec<FilterRule>,
-    /// Destination blocklist rules (mutually exclusive with `allow`).
+    /// Destination blocklist rules (combine with `allow` to carve out exceptions).
     pub block: Vec<FilterRule>,
     pub mitm_ca_cert: Option<PathBuf>,
     pub mitm_ca_key: Option<PathBuf>,
@@ -1334,10 +1344,10 @@ socks_log = "/file/socks.log"
         let _env = EnvGuard::new(&[]);
         let cfg = load(&[]).unwrap();
         assert_eq!(cfg.max_connections, 4096);
-        assert_eq!(cfg.mitm_cert_cache_max_entries, 10_000);
+        assert_eq!(cfg.mitm_cert_cache_max_entries, 10_240);
         let s = cfg.summary();
         assert!(s.contains("max_connections=4096"), "{s}");
-        assert!(s.contains("mitm_cert_cache_max_entries=10000"), "{s}");
+        assert!(s.contains("mitm_cert_cache_max_entries=10240"), "{s}");
     }
 
     #[test]

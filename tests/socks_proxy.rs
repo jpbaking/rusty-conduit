@@ -654,7 +654,8 @@ async fn block_web_allows_raw_tcp_and_server_speaks_first() {
 #[tokio::test]
 async fn block_web_flag_is_active_without_mitm() {
     let up = echo().await;
-    let proxy = SocksServer::start("flag-without-mitm", LogFormat::Text, Mode::FlagWithoutMitm).await;
+    let proxy =
+        SocksServer::start("flag-without-mitm", LogFormat::Text, Mode::FlagWithoutMitm).await;
 
     let (mut s, rep) = socks5(proxy.addr, 1, Addr::V4([127, 0, 0, 1]), up.addr.port()).await;
     assert_eq!(rep, 0x00);
@@ -666,10 +667,7 @@ async fn block_web_flag_is_active_without_mitm() {
     drop(s);
 
     let lines = proxy.wait_log_lines(1).await;
-    assert!(
-        lines[0].contains("status=blocked_web_in_mitm"),
-        "{lines:?}"
-    );
+    assert!(lines[0].contains("status=blocked_web_in_mitm"), "{lines:?}");
     assert_eq!(up.received.load(Ordering::SeqCst), 0);
     proxy.stop().await;
 }

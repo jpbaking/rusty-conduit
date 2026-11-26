@@ -155,7 +155,7 @@ rusty-conduit --log-level DEBUG
 
 ### Block private / loopback destinations (or allowlist specific hosts)
 
-Use `--block` or `--allow` (mutually exclusive; repeatable or comma-separated) with IPs, CIDRs, exact FQDNs, or `*.domain` wildcards:
+Use `--block` or `--allow` (repeatable or comma-separated; together, `--allow` entries are exceptions to `--block`) with IPs, CIDRs, exact FQDNs, or `*.domain` wildcards:
 
 ```sh
 # Block loopback and RFC 1918 LAN ranges
@@ -173,10 +173,16 @@ rusty-conduit --bind 0.0.0.0
 
 > **Note:** v1 has **no proxy authentication**. Binding to a non-loopback address prints a security notice at startup — restrict access with your firewall and keep `--max-connections` bounded (see [Performance, Footprint & Sizing](PERFORMANCE-AND-SIZING.md)).
 
+### Check a configuration before starting
+
+```sh
+rusty-conduit validate --config proxy.toml
+```
+
 ---
 
 ## 5. Where to Go Next
 
-- **[Advanced User Guide](USER-GUIDE-ADVANCED.md):** TOML config files, environment variables, HTTPS MITM inspection, `--socks-block-web-in-mitm`, JSON logs, and full CLI reference.
+- **[Advanced User Guide](USER-GUIDE-ADVANCED.md):** TOML config files, environment variables, HTTPS MITM inspection, `--socks-block-web`, JSON logs, and full CLI reference.
 - **[MITM CA Guide](MITM-CA-GUIDE.md):** Step-by-step instructions to generate and trust your own private CA.
 - **[Performance, Footprint & Sizing](PERFORMANCE-AND-SIZING.md):** Memory/CPU budgets, `ulimit -n` math, and connection/cache caps.
