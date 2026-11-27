@@ -12,7 +12,8 @@
 - **One binary, all protocols:** Serves plain HTTP forwarding, HTTPS `CONNECT`, SOCKS4, SOCKS4a, and SOCKS5 on separate ports (`3128` / `1080`) or **auto-multiplexed on a single port**.
 - **Strictly zero caching:** Never caches HTTP responses, DNS lookups, or upstream connections, and streams bodies without full buffering. The **only** in-memory cache is for dynamically signed MITM leaf certificates — strictly bounded by TTL and max-entry caps.
 - **Pure-Rust TLS, zero OpenSSL:** Built on `rustls` + `ring`, `rcgen`, and `p12-keystore`. Identical single-binary builds on **Linux, macOS (Apple Silicon & Intel), and Windows (`amd64` & `arm64`)**.
-- **Opt-in HTTPS MITM without surprises:** OFF by default and **never auto-generates a CA**. Bring your own PEM or PKCS#12 CA, inspect HTTP/1.1 & HTTP/2 traffic, and optionally block web traffic over SOCKS (`--socks-block-web`).
+- **Opt-in HTTPS MITM without surprises:** OFF by default and **never auto-generates a CA**. Bring your own PEM or PKCS#12 CA, inspect HTTP/1.1 & HTTP/2 traffic, and optionally block web traffic over SOCKS (`--socks-block-web`). Upstream certificates are verified strictly by default; for lab or self-signed origins, `--mitm-insecure-host <RULE>` (TOML `[mitm] insecure_hosts`) skips verification only for matching hosts, IPs, or CIDRs, and `--mitm-insecure` (TOML `[mitm] insecure = true`) blindly trusts every upstream — **unsafe**, and logged as a startup warning.
+- **Your own error pages:** Swap the built-in HTML for proxy-generated errors (`400`, `403`, `502`, `504`, …) with `--error-page <PATH>` (`RUSTY_CONDUIT_ERROR_PAGE`, TOML `error_page`), using the `{{status}}`, `{{reason}}`, `{{message}}`, and `{{target}}` placeholders (HTML-escaped). Responses from upstream origins are never altered.
 - **Destination allowlist / blocklist:** Restrict egress with `--allow` or `--block` (IP, CIDR, exact FQDN, or `*.domain` wildcards), checking both hostnames and resolved IPs before connecting.
 - **Survives long silent connections:** No idle timeout on established tunnels, plus TCP keepalive on client and upstream sockets (default `60s` idle / `10s` × `5` probes) so NAT, firewalls, and VPNs don't drop agents waiting on slow responses.
 - **Built for operators:** `CLI > env > TOML` configuration, 6 diagnostic log levels, structured `text` (logfmt) or `json` (NDJSON) access/SOCKS logs, graceful shutdown draining, and built-in connection & cert-cache caps, with a small footprint: about 7 MB idle and 26 KB per open tunnel (Linux with `MALLOC_ARENA_MAX=2`, which the container image sets; see [sizing](docs/PERFORMANCE-AND-SIZING.md)).
@@ -63,7 +64,7 @@ rusty-conduit --http-port 8888 --socks-port 8888 --log-level DEBUG
 | Guide | What's inside |
 | :--- | :--- |
 | **[Basic User Guide](docs/USER-GUIDE-BASIC.md)** | Installing, connecting browsers/CLI tools, common flags, single-port mode, and watching logs |
-| **[Advanced User Guide](docs/USER-GUIDE-ADVANCED.md)** | Full CLI/env/TOML reference, HTTPS MITM inspection, `--socks-block-web`, and JSON logging |
+| **[Advanced User Guide](docs/USER-GUIDE-ADVANCED.md)** | Full CLI/env/TOML reference, HTTPS MITM inspection, `--socks-block-web`, JSON logging, and custom error pages |
 | **[MITM CA Guide](docs/MITM-CA-GUIDE.md)** | Generating your own PEM or PKCS#12 CA with `openssl` and trusting it on Linux, macOS, Windows, and Firefox |
 | **[Performance, Footprint & Sizing](docs/PERFORMANCE-AND-SIZING.md)** | Measured CPU/RAM footprint, `ulimit -n` and `somaxconn` limits, concurrent user sizing, and resource caps |
 | **[Docker Guide](docs/DOCKER-GUIDE.md)** | Images, `docker run` and Compose examples, config and log mounts, MITM secrets, limits, health checks, and hardening |

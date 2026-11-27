@@ -20,8 +20,9 @@ use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcom
 use serde::Deserialize;
 
 use crate::filter::{FilterRule, HostFilter};
+use crate::http::ErrorPageTemplate;
 use crate::logging::{LogFormat, LogLevel};
-use crate::mitm::MitmOptions;
+use crate::mitm::{MitmOptions, UpstreamTlsVerification};
 use crate::net::KeepaliveSettings;
 use crate::routing::RoutingInput;
 use crate::server::ServerOptions;
@@ -80,6 +81,8 @@ pub enum ConfigError {
     },
     #[error("invalid TCP keepalive setting: {0}")]
     InvalidKeepalive(String),
+    #[error("invalid --mitm-insecure-host rule {rule:?}: {message}")]
+    InvalidMitmInsecureHost { rule: String, message: String },
 }
 
 /// Subcommands. Without one, the proxy runs.
@@ -216,6 +219,25 @@ pub struct CliArgs {
     )]
     pub mitm_cert_cache_max_entries: Option<usize>,
 
+    /// Accept invalid/self-signed upstream TLS certificates under MITM for matching destinations
+    /// (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated
+    #[arg(
+        long = "mitm-insecure-host",
+        value_name = "RULE",
+        value_delimiter = ',',
+        env = "RUSTY_CONDUIT_MITM_INSECURE_HOST"
+    )]
+    pub mitm_insecure_host: Vec<String>,
+
+    /// UNSAFE blind trust: skip upstream TLS certificate verification for ALL MITM targets
+    #[arg(
+        long = "mitm-insecure",
+        env = "RUSTY_CONDUIT_MITM_INSECURE",
+        action = ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub mitm_insecure: bool,
+
     /// Reject HTTP/HTTPS traffic over SOCKS4/4a/5 (works with or without MITM)
     #[arg(
         long,
@@ -224,6 +246,11 @@ pub struct CliArgs {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     pub socks_block_web: bool,
+
+    /// HTML template file for proxy-generated HTTP error pages (placeholders: {{status}},
+    /// {{reason}}, {{message}}, {{target}}) [default: built-in page]
+    #[arg(long, value_name = "PATH", env = "RUSTY_CONDUIT_ERROR_PAGE")]
+    pub error_page: Option<PathBuf>,
 
     /// Log level: QUIET, FATAL, ERROR, INFO, DEBUG, VERBOSE (case-insensitive) [default: INFO]
     #[arg(long, value_name = "LEVEL", env = "RUSTY_CONDUIT_LOG_LEVEL")]
@@ -306,6 +333,8 @@ pub struct FileConfig {
     pub block: Option<Vec<String>>,
     /// Reject HTTP/HTTPS traffic over SOCKS4/4a/5 (works with or without MITM).
     pub socks_block_web: Option<bool>,
+    /// HTML template file for proxy-generated HTTP error pages.
+    pub error_page: Option<PathBuf>,
     #[serde(default)]
     pub mitm: FileMitmConfig,
     #[serde(default)]
@@ -324,6 +353,11 @@ pub struct FileMitmConfig {
     /// Human-readable duration such as `30m`, `1h`, or `3600s`.
     pub cert_ttl: Option<String>,
     pub cert_cache_max_entries: Option<usize>,
+    /// Destinations (IP, CIDR, FQDN, or `*.domain`) whose upstream TLS certificates are not verified.
+    #[serde(default)]
+    pub insecure_hosts: Vec<String>,
+    /// Blind trust: skip upstream TLS certificate verification for every MITM target (unsafe).
+    pub insecure: Option<bool>,
 }
 
 /// `[logging]` table of the TOML configuration file.
@@ -385,7 +419,14 @@ pub struct Config {
     pub mitm_cert_ttl: Duration,
     /// Maximum cached MITM leaf certificates (`0` = unlimited).
     pub mitm_cert_cache_max_entries: usize,
+    /// Upstream TLS verification is skipped for MITM targets matching these rules
+    /// (`FilterRule` syntax; checked by [`Config::validate`]).
+    pub mitm_insecure_hosts: Vec<String>,
+    /// Blind trust: upstream TLS verification is skipped for every MITM target.
+    pub mitm_insecure: bool,
     pub socks_block_web: bool,
+    /// HTML template for proxy-generated HTTP error pages (`None` = built-in page).
+    pub error_page: Option<PathBuf>,
     pub log_level: LogLevel,
     pub log_format: LogFormat,
     pub http_access_log: Option<PathBuf>,
@@ -420,7 +461,10 @@ impl fmt::Debug for Config {
                 "mitm_cert_cache_max_entries",
                 &self.mitm_cert_cache_max_entries,
             )
+            .field("mitm_insecure_hosts", &self.mitm_insecure_hosts)
+            .field("mitm_insecure", &self.mitm_insecure)
             .field("socks_block_web", &self.socks_block_web)
+            .field("error_page", &self.error_page)
             .field("log_level", &self.log_level)
             .field("log_format", &self.log_format)
             .field("http_access_log", &self.http_access_log)
@@ -450,7 +494,10 @@ impl Default for Config {
             mitm_ca_passphrase_file: None,
             mitm_cert_ttl: DEFAULT_MITM_CERT_TTL,
             mitm_cert_cache_max_entries: DEFAULT_MITM_CERT_CACHE_MAX_ENTRIES,
+            mitm_insecure_hosts: Vec::new(),
+            mitm_insecure: false,
             socks_block_web: false,
+            error_page: None,
             log_level: LogLevel::Info,
             log_format: LogFormat::Text,
             http_access_log: None,
@@ -525,6 +572,12 @@ impl Config {
         } else {
             a.block
         };
+        let mitm_insecure_hosts = if a.mitm_insecure_host.is_empty() {
+            file.mitm.insecure_hosts
+        } else {
+            a.mitm_insecure_host
+        };
+        let mitm_insecure = a.mitm_insecure || file.mitm.insecure.unwrap_or(false);
 
         Ok(Config {
             config_path: a.config,
@@ -559,7 +612,10 @@ impl Config {
                 .mitm_cert_cache_max_entries
                 .or(file.mitm.cert_cache_max_entries)
                 .unwrap_or(d.mitm_cert_cache_max_entries),
+            mitm_insecure_hosts,
+            mitm_insecure,
             socks_block_web,
+            error_page: a.error_page.or(file.error_page),
             log_level: a.log_level.or(file_level).unwrap_or(d.log_level),
             log_format: a.log_format.or(file_format).unwrap_or(d.log_format),
             http_access_log: a.http_access_log.or(file.logging.http_access_log),
@@ -586,6 +642,7 @@ impl Config {
         if self.mitm_cert_ttl < MIN_MITM_CERT_TTL {
             return Err(ConfigError::CertTtlTooShort(self.mitm_cert_ttl));
         }
+        self.mitm_insecure_rules()?;
         if !self.tcp_keepalive.is_zero() {
             let secs = Duration::from_secs(1)..=MAX_TCP_KEEPALIVE_DURATION;
             let fmt = |d: Duration| humantime::format_duration(d).to_string();
@@ -644,7 +701,51 @@ impl Config {
         }
     }
 
-    /// Engine MITM settings (CA source, passphrase sources, leaf TTL, cache cap).
+    /// Parse `mitm_insecure_hosts` into filter rules; the first invalid rule is an error.
+    pub fn mitm_insecure_rules(&self) -> Result<Vec<FilterRule>, ConfigError> {
+        self.mitm_insecure_hosts
+            .iter()
+            .map(|rule| {
+                rule.parse::<FilterRule>()
+                    .map_err(|message| ConfigError::InvalidMitmInsecureHost {
+                        rule: rule.clone(),
+                        message,
+                    })
+            })
+            .collect()
+    }
+
+    /// Upstream TLS verification mode: blind trust wins over the host list, else strict.
+    ///
+    /// Invalid host rules are rejected by [`Config::validate`]; any left on an unvalidated
+    /// config are skipped here, so they never widen the insecure set.
+    pub fn upstream_tls(&self) -> UpstreamTlsVerification {
+        if self.mitm_insecure {
+            UpstreamTlsVerification::InsecureAll
+        } else if !self.mitm_insecure_hosts.is_empty() {
+            UpstreamTlsVerification::AllowInsecureHosts(
+                self.mitm_insecure_hosts
+                    .iter()
+                    .filter_map(|rule| rule.parse::<FilterRule>().ok())
+                    .collect(),
+            )
+        } else {
+            UpstreamTlsVerification::Strict
+        }
+    }
+
+    /// Load the proxy error-page template: the `--error-page` file, or the built-in page.
+    ///
+    /// The error names the path, for a `FATAL` startup or `validate` message.
+    pub fn error_page_template(&self) -> Result<ErrorPageTemplate, String> {
+        match &self.error_page {
+            Some(path) => ErrorPageTemplate::from_file(path)
+                .map_err(|e| format!("cannot read --error-page {}: {e}", path.display())),
+            None => Ok(ErrorPageTemplate::builtin()),
+        }
+    }
+
+    /// Engine MITM settings (CA source, passphrase sources, leaf TTL, cache cap, upstream TLS).
     pub fn mitm_options(&self) -> MitmOptions {
         MitmOptions {
             ca: self.ca_source(),
@@ -652,7 +753,31 @@ impl Config {
             passphrase_file: self.mitm_ca_passphrase_file.clone(),
             cert_ttl: self.mitm_cert_ttl,
             cert_cache_max: self.mitm_cert_cache_max_entries,
+            upstream_tls: self.upstream_tls(),
         }
+    }
+
+    /// Startup warnings about relaxed upstream TLS verification (empty unless MITM is on).
+    pub fn mitm_tls_warnings(&self) -> Vec<String> {
+        if !self.mitm_enabled() {
+            return Vec::new();
+        }
+        if self.mitm_insecure {
+            return vec![
+                "WARN: MITM blind-trust mode (--mitm-insecure) is enabled: upstream HTTPS \
+                 certificates will NOT be verified for any destination"
+                    .to_string(),
+            ];
+        }
+        if !self.mitm_insecure_hosts.is_empty() {
+            return vec![format!(
+                "WARN: MITM upstream TLS certificate verification is skipped for {} \
+                 --mitm-insecure-host rule(s): {}",
+                self.mitm_insecure_hosts.len(),
+                self.mitm_insecure_hosts.join(",")
+            )];
+        }
+        Vec::new()
     }
 
     /// Engine listener settings (bind, ports, connection cap, client TCP keepalive).
@@ -772,13 +897,20 @@ impl Config {
             ),
             None => "off".to_string(),
         };
+        let upstream_tls = match self.upstream_tls() {
+            UpstreamTlsVerification::Strict => "strict".to_string(),
+            UpstreamTlsVerification::AllowInsecureHosts(rules) => {
+                format!("insecure_hosts({})", rules.len())
+            }
+            UpstreamTlsVerification::InsecureAll => "insecure_all".to_string(),
+        };
         let filter = self
             .host_filter()
             .map(|f| format!(" filter={}({})", f.mode_str(), f.len()))
             .unwrap_or_default();
         format!(
             "bind={} http_port={} socks_port={} multiplexed={} max_connections={} tcp_keepalive={keepalive} mitm={} \
-             mitm_cert_ttl={} mitm_cert_cache_max_entries={} socks_block_web={} log_level={} log_format={} http_access_log={} socks_log={} \
+             mitm_cert_ttl={} mitm_cert_cache_max_entries={} mitm_upstream_tls={upstream_tls} socks_block_web={} error_page={} log_level={} log_format={} http_access_log={} socks_log={} \
              config={}{filter}",
             self.bind,
             port(self.http_port),
@@ -789,6 +921,10 @@ impl Config {
             humantime::format_duration(self.mitm_cert_ttl),
             cap(self.mitm_cert_cache_max_entries),
             self.socks_block_web,
+            self.error_page
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "builtin".to_string()),
             self.log_level,
             self.log_format,
             path(&self.http_access_log),
@@ -851,7 +987,10 @@ mod tests {
         "RUSTY_CONDUIT_MITM_CA_PASSPHRASE",
         "RUSTY_CONDUIT_MITM_CA_PASSPHRASE_FILE",
         "RUSTY_CONDUIT_MITM_CERT_TTL",
+        "RUSTY_CONDUIT_MITM_INSECURE_HOST",
+        "RUSTY_CONDUIT_MITM_INSECURE",
         "RUSTY_CONDUIT_SOCKS_BLOCK_WEB",
+        "RUSTY_CONDUIT_ERROR_PAGE",
         "RUSTY_CONDUIT_LOG_LEVEL",
         "RUSTY_CONDUIT_LOG_FORMAT",
         "RUSTY_CONDUIT_HTTP_ACCESS_LOG",
@@ -1582,5 +1721,218 @@ allow = ["example.com", "192.168.0.0/16"]
             }
         ));
         let _ = fs::remove_file(&path);
+    }
+
+    fn rules(raw: &[&str]) -> Vec<FilterRule> {
+        raw.iter().map(|r| r.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn mitm_insecure_cli_flags() {
+        let _env = EnvGuard::new(&[]);
+        let cfg = load(&[]).unwrap();
+        assert!(!cfg.mitm_insecure);
+        assert!(cfg.mitm_insecure_hosts.is_empty());
+
+        let cfg = load(&["--mitm-insecure"]).unwrap();
+        assert!(cfg.mitm_insecure);
+
+        let cfg = load(&[
+            "--mitm-insecure-host",
+            "dev.local",
+            "--mitm-insecure-host",
+            "10.0.0.0/8,*.lab.example",
+        ])
+        .unwrap();
+        assert_eq!(
+            cfg.mitm_insecure_hosts,
+            vec!["dev.local", "10.0.0.0/8", "*.lab.example"]
+        );
+        assert!(!cfg.mitm_insecure);
+    }
+
+    #[test]
+    fn mitm_insecure_env_vars() {
+        let _env = EnvGuard::new(&[
+            ("RUSTY_CONDUIT_MITM_INSECURE", "true"),
+            ("RUSTY_CONDUIT_MITM_INSECURE_HOST", "a.example,192.0.2.7"),
+        ]);
+        let cfg = load(&[]).unwrap();
+        assert!(cfg.mitm_insecure);
+        assert_eq!(cfg.mitm_insecure_hosts, vec!["a.example", "192.0.2.7"]);
+    }
+
+    #[test]
+    fn mitm_insecure_toml_and_precedence() {
+        let _env = EnvGuard::new(&[]);
+        let path = temp_file(
+            "[mitm]\ninsecure = true\ninsecure_hosts = [\"file.example\", \"172.16.0.0/12\"]\n",
+        );
+        let p = path.to_str().unwrap();
+        let cfg = load(&["--config", p]).unwrap();
+        assert!(cfg.mitm_insecure);
+        assert_eq!(
+            cfg.mitm_insecure_hosts,
+            vec!["file.example", "172.16.0.0/12"]
+        );
+
+        // CLI hosts replace the file list, as --allow / --block do.
+        let cfg = load(&["--config", p, "--mitm-insecure-host", "cli.example"]).unwrap();
+        assert_eq!(cfg.mitm_insecure_hosts, vec!["cli.example"]);
+        let _ = fs::remove_file(&path);
+
+        // Blind trust is CLI OR file.
+        let path = temp_file("[mitm]\ninsecure = false\n");
+        let p = path.to_str().unwrap();
+        assert!(!load(&["--config", p]).unwrap().mitm_insecure);
+        assert!(
+            load(&["--config", p, "--mitm-insecure"])
+                .unwrap()
+                .mitm_insecure
+        );
+        let _ = fs::remove_file(&path);
+
+        let file = FileConfig::from_toml_str("[mitm]\n", Path::new("x.toml")).unwrap();
+        assert!(file.mitm.insecure_hosts.is_empty());
+        assert_eq!(file.mitm.insecure, None);
+    }
+
+    #[test]
+    fn fatal_invalid_mitm_insecure_host() {
+        let _env = EnvGuard::new(&[]);
+        let err = load(&["--mitm-insecure-host", "10.0.0.0/99"]).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::InvalidMitmInsecureHost { rule, .. } if rule == "10.0.0.0/99"),
+            "{err}"
+        );
+
+        let path = temp_file("[mitm]\ninsecure_hosts = [\"ok.example\", \"bad host!\"]\n");
+        let err = load(&["--config", path.to_str().unwrap()]).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::InvalidMitmInsecureHost { rule, .. } if rule == "bad host!"),
+            "{err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mitm_options_upstream_tls_modes() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.mitm_options().upstream_tls,
+            UpstreamTlsVerification::Strict
+        );
+        assert!(cfg.summary().contains("mitm_upstream_tls=strict"));
+
+        let cfg = Config {
+            mitm_insecure_hosts: vec!["dev.local".into(), "10.0.0.0/8".into()],
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.mitm_options().upstream_tls,
+            UpstreamTlsVerification::AllowInsecureHosts(rules(&["dev.local", "10.0.0.0/8"]))
+        );
+        assert!(cfg
+            .summary()
+            .contains("mitm_upstream_tls=insecure_hosts(2)"));
+
+        let cfg = Config {
+            mitm_insecure: true,
+            mitm_insecure_hosts: vec!["dev.local".into()],
+            ..Config::default()
+        };
+        assert_eq!(
+            cfg.mitm_options().upstream_tls,
+            UpstreamTlsVerification::InsecureAll
+        );
+        assert!(cfg.summary().contains("mitm_upstream_tls=insecure_all"));
+    }
+
+    #[test]
+    fn mitm_tls_warnings_only_with_mitm_enabled() {
+        let mitm = Config {
+            mitm_ca_p12: Some(PathBuf::from("/ca.p12")),
+            ..Config::default()
+        };
+        assert!(mitm.mitm_tls_warnings().is_empty());
+
+        let off = Config {
+            mitm_insecure: true,
+            ..Config::default()
+        };
+        assert!(off.mitm_tls_warnings().is_empty());
+
+        let all = Config {
+            mitm_insecure: true,
+            ..mitm.clone()
+        };
+        let w = all.mitm_tls_warnings();
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("blind-trust mode (--mitm-insecure)"), "{w:?}");
+
+        let hosts = Config {
+            mitm_insecure_hosts: vec!["a.example".into(), "10.0.0.0/8".into()],
+            ..mitm
+        };
+        let w = hosts.mitm_tls_warnings();
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("skipped for 2"), "{w:?}");
+    }
+
+    #[test]
+    fn error_page_cli_env_toml_and_precedence() {
+        let _env = EnvGuard::new(&[]);
+        let cfg = load(&[]).unwrap();
+        assert_eq!(cfg.error_page, None);
+        assert!(
+            cfg.summary().contains(" error_page=builtin "),
+            "{}",
+            cfg.summary()
+        );
+        assert!(cfg.error_page_template().unwrap().is_builtin());
+
+        let cfg = load(&["--error-page", "/cli/page.html"]).unwrap();
+        assert_eq!(cfg.error_page, Some(PathBuf::from("/cli/page.html")));
+        assert!(cfg.summary().contains(" error_page=/cli/page.html "));
+        assert!(format!("{cfg:?}").contains("error_page: Some(\"/cli/page.html\")"));
+
+        let path = temp_file("error_page = \"/file/page.html\"\n");
+        let p = path.to_str().unwrap();
+        let cfg = load(&["--config", p]).unwrap();
+        assert_eq!(cfg.error_page, Some(PathBuf::from("/file/page.html")));
+
+        // CLI overrides the file.
+        let cfg = load(&["--config", p, "--error-page", "/cli/page.html"]).unwrap();
+        assert_eq!(cfg.error_page, Some(PathBuf::from("/cli/page.html")));
+        drop(_env);
+
+        // Env overrides the file; CLI overrides env.
+        let _env = EnvGuard::new(&[("RUSTY_CONDUIT_ERROR_PAGE", "/env/page.html")]);
+        let cfg = load(&[]).unwrap();
+        assert_eq!(cfg.error_page, Some(PathBuf::from("/env/page.html")));
+        let cfg = load(&["--config", p]).unwrap();
+        assert_eq!(cfg.error_page, Some(PathBuf::from("/env/page.html")));
+        let cfg = load(&["--config", p, "--error-page", "/cli/page.html"]).unwrap();
+        assert_eq!(cfg.error_page, Some(PathBuf::from("/cli/page.html")));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn error_page_template_loads_file_or_names_missing_path() {
+        let _env = EnvGuard::new(&[]);
+        let page = temp_file("<h1>{{status}} {{reason}}</h1>");
+        let cfg = load(&["--error-page", page.to_str().unwrap()]).unwrap();
+        let template = cfg.error_page_template().unwrap();
+        assert!(!template.is_builtin());
+        assert_eq!(template.as_str(), "<h1>{{status}} {{reason}}</h1>");
+        let _ = fs::remove_file(&page);
+
+        let missing = std::env::temp_dir().join("rusty-conduit-no-such-error-page.html");
+        let cfg = load(&["--error-page", missing.to_str().unwrap()]).unwrap();
+        let err = cfg.error_page_template().unwrap_err();
+        assert!(
+            err.starts_with(&format!("cannot read --error-page {}", missing.display())),
+            "{err}"
+        );
     }
 }

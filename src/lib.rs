@@ -20,7 +20,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use config::{CliInput, Command, Config};
-use http::HttpProxy;
+use http::{ErrorPageTemplate, HttpProxy};
 use logging::{AccessLogConfig, AccessLogger, LogLevel, Logger};
 use mitm::MitmState;
 use routing::{RoutingSetupError, RoutingState, SharedRouting};
@@ -43,7 +43,7 @@ pub fn load_config(cli: CliInput) -> Result<Config, (config::ConfigError, LogLev
     Ok(cfg)
 }
 
-/// Emit the startup banner, configuration summary, and any `INFO` notices.
+/// Emit the startup banner, configuration summary, `INFO` notices, and MITM upstream-TLS warnings.
 pub fn log_startup(cfg: &Config, logger: &Logger) {
     logger.info(format!(
         "rusty-conduit v{} starting",
@@ -52,6 +52,9 @@ pub fn log_startup(cfg: &Config, logger: &Logger) {
     logger.info(format!("config: {}", cfg.summary()));
     for notice in cfg.notices() {
         logger.info(notice);
+    }
+    for warning in cfg.mitm_tls_warnings() {
+        logger.info(warning);
     }
 }
 
@@ -102,7 +105,17 @@ pub async fn run(cfg: Config, logger: Logger) -> ExitCode {
     if let Some(m) = &mitm {
         m.cache.set_logger(logger.clone());
     }
-    let (http, socks) = build_engines_with(routing, &cfg, mitm.as_ref(), &access, &logger);
+    let error_page = match cfg.error_page_template() {
+        Ok(t) => t,
+        Err(e) => {
+            logger.fatal(format!("config invalid: {e}"));
+            let _ = access.shutdown().await;
+            logger.flush();
+            return ExitCode::from(EXIT_FATAL);
+        }
+    };
+    let (http, socks) =
+        build_engines_with(routing, &cfg, mitm.as_ref(), error_page, &access, &logger);
     let handlers: Arc<dyn ProtocolHandlers> = Arc::new(EngineHandlers::new(http, socks));
     let server = match Server::from_options(&cfg.server_options(), handlers, logger.clone()).await {
         Ok(s) => s,
@@ -163,13 +176,15 @@ pub fn routing_state(cfg: &Config) -> Result<SharedRouting, RoutingSetupError> {
 
 /// Build the HTTP and SOCKS engines, enabling destination filtering when `--allow`/`--block`
 /// is configured, HTTPS interception when `mitm` is present, and the SOCKS web guard when
-/// additionally `--socks-block-web` is set.
+/// additionally `--socks-block-web` is set, and the `--error-page` template (or the built-in
+/// page) for proxy-generated HTTP errors.
 ///
 /// # Panics
 ///
 /// If the direct-only routing state fails to compile, which a validated [`Config`] cannot
-/// cause (it declares no profiles and no rules); [`run`] reports such errors via
-/// [`routing_state`] instead.
+/// cause (it declares no profiles and no rules), or if the `--error-page` file cannot be
+/// read; [`run`] reports such errors via [`routing_state`] and
+/// [`Config::error_page_template`] instead.
 pub fn build_engines(
     cfg: &Config,
     mitm: Option<&MitmState>,
@@ -177,14 +192,16 @@ pub fn build_engines(
     logger: &Logger,
 ) -> (HttpProxy, SocksProxy) {
     let routing = routing_state(cfg).expect("direct-only routing state always compiles");
-    build_engines_with(routing, cfg, mitm, access, logger)
+    let error_page = cfg.error_page_template().unwrap_or_else(|e| panic!("{e}"));
+    build_engines_with(routing, cfg, mitm, error_page, access, logger)
 }
 
-/// Like [`build_engines`], over an already compiled routing state.
+/// Like [`build_engines`], over an already compiled routing state and a loaded error page.
 pub fn build_engines_with(
     routing: SharedRouting,
     cfg: &Config,
     mitm: Option<&MitmState>,
+    error_page: ErrorPageTemplate,
     access: &AccessLogger,
     logger: &Logger,
 ) -> (HttpProxy, SocksProxy) {
@@ -199,7 +216,12 @@ pub fn build_engines_with(
     // rusty-conduit has no routing rules: keep the v1.2.0 access-record shape (no `rule`,
     // `profile`, or `upstream` fields).
     let access = access.clone().with_routing_fields(false);
-    let mut engines = EngineHandlers::from_routing(routing, access, logger.clone());
+    if let Some(path) = &cfg.error_page {
+        logger.info(format!("custom error page enabled: {}", path.display()));
+    }
+    // Only proxy-generated errors use the template; upstream responses pass through untouched.
+    let mut engines =
+        EngineHandlers::from_routing(routing, access, logger.clone()).with_error_page(error_page);
     if let Some(m) = mitm {
         logger.info(format!(
             "MITM enabled: CA \"{}\" valid until {}; leaf certificate TTL {}",
@@ -265,7 +287,8 @@ pub fn preflight_checks(cfg: &Config) -> Result<(), String> {
         preflight::check_log_path("--socks-log", path)?;
     }
     routing_state(cfg).map_err(|e| e.to_string())?;
-    preflight::check_mitm(&cfg.mitm_options())
+    preflight::check_mitm(&cfg.mitm_options())?;
+    cfg.error_page_template().map(|_| ())
 }
 
 /// `validate [--settings-only]`: exit 0 when the configuration is valid, 1 otherwise.
@@ -295,6 +318,9 @@ pub fn cmd_validate(cli: CliInput, out: &mut dyn Write, err: &mut dyn Write) -> 
             let _ = writeln!(out, "config OK: {path}");
             for notice in cfg.notices() {
                 let _ = writeln!(out, "{notice}");
+            }
+            for warning in cfg.mitm_tls_warnings() {
+                let _ = writeln!(out, "{warning}");
             }
             if !settings_only {
                 if let Some(notice) =
@@ -638,5 +664,59 @@ mod tests {
     #[tokio::test]
     async fn http_proxy_active_on_multiplexed_listener() {
         check_plan(ListenPlan::Multiplexed("127.0.0.1:0".parse().unwrap())).await;
+    }
+
+    #[test]
+    fn missing_error_page_fails_preflight_naming_the_path() {
+        let missing = std::env::temp_dir().join("rusty-conduit-missing-error-page.html");
+        let cfg = Config {
+            error_page: Some(missing.clone()),
+            ..Config::default()
+        };
+        cfg.validate()
+            .expect("settings alone stay valid (--settings-only)");
+        let err = preflight_checks(&cfg).unwrap_err();
+        assert!(
+            err.starts_with(&format!("cannot read --error-page {}", missing.display())),
+            "{err}"
+        );
+        assert_eq!(preflight_checks(&Config::default()), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn missing_error_page_fails_startup_with_fatal_exit() {
+        let missing = std::env::temp_dir().join("rusty-conduit-missing-error-page.html");
+        let cfg = Config {
+            http_port: 0,
+            socks_port: 0,
+            error_page: Some(missing),
+            ..Config::default()
+        };
+        let code = run(cfg, quiet_logger()).await;
+        assert_eq!(code, ExitCode::from(EXIT_FATAL));
+    }
+
+    #[tokio::test]
+    async fn build_engines_installs_the_error_page() {
+        let dir = std::env::temp_dir();
+        let page = dir.join(format!(
+            "rusty-conduit-error-page-{}.html",
+            std::process::id()
+        ));
+        std::fs::write(&page, "<p>custom {{status}} {{reason}} [{{target}}]</p>").unwrap();
+        let cfg = Config {
+            error_page: Some(page.clone()),
+            ..Config::default()
+        };
+        let (access, _buf) = capture_access().await;
+        let (http, _socks) = build_engines(&cfg, None, &access, &quiet_logger());
+        assert!(!http.error_page().is_builtin());
+        assert_eq!(
+            http.error_page().as_str(),
+            "<p>custom {{status}} {{reason}} [{{target}}]</p>"
+        );
+        let (http, _socks) = build_engines(&Config::default(), None, &access, &quiet_logger());
+        assert!(http.error_page().is_builtin());
+        let _ = std::fs::remove_file(&page);
     }
 }
