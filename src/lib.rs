@@ -7,8 +7,8 @@
 //! fixed `direct` route and no routing rules.
 
 pub mod config;
-pub mod fdlimit;
-pub mod preflight;
+pub use rusty_conduit_engine::cli_support::shutdown_signal;
+pub use rusty_conduit_engine::cli_support::{fdlimit, preflight};
 #[cfg(test)]
 mod test_support;
 
@@ -236,43 +236,6 @@ pub fn build_engines_with(
         engines.http_engine().clone(),
         engines.socks_engine().clone(),
     )
-}
-
-/// Resolve when the process receives `Ctrl+C` (all platforms) or `SIGTERM` (Unix).
-///
-/// If a signal handler cannot be installed the error is logged and that source is ignored.
-pub async fn shutdown_signal(logger: &Logger) {
-    let ctrl_c = async {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => logger.info("received Ctrl+C"),
-            Err(e) => {
-                logger.error(format!("failed to listen for Ctrl+C: {e}"));
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut sig) => {
-                sig.recv().await;
-                logger.info("received SIGTERM");
-            }
-            Err(e) => {
-                logger.error(format!("failed to listen for SIGTERM: {e}"));
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        () = ctrl_c => {}
-        () = terminate => {}
-    }
 }
 
 /// The offline checks startup would fail on (see [`preflight`]), in startup order.

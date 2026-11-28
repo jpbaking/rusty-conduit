@@ -1296,7 +1296,6 @@ dependencies = [
  "libc",
  "p12-keystore",
  "rcgen",
- "rlimit",
  "rustls",
  "rusty-conduit-engine",
  "serde",
@@ -1314,7 +1313,7 @@ dependencies = [
 [[package]]
 name = "rusty-conduit-engine"
 version = "0.6.0"
-source = "git+https://github.com/jpbaking/rusty-conduit-engine?tag=v0.6.0#274dbdd4590f2a65f9df0fa182acc86df98782cf"
+source = "git+https://github.com/jpbaking/rusty-conduit-engine?rev=05485a4c0fdd5315e4e6954a199a55d34cd17bc1#05485a4c0fdd5315e4e6954a199a55d34cd17bc1"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -1326,8 +1325,10 @@ dependencies = [
  "humantime",
  "hyper",
  "hyper-util",
+ "libc",
  "p12-keystore",
  "rcgen",
+ "rlimit",
  "rustls",
  "rustls-platform-verifier",
  "serde",

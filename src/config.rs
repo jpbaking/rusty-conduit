@@ -26,6 +26,9 @@ use crate::mitm::{MitmOptions, UpstreamTlsVerification};
 use crate::net::KeepaliveSettings;
 use crate::routing::RoutingInput;
 use crate::server::ServerOptions;
+use rusty_conduit_engine::cli_support::file::{
+    merge_logging, merge_mitm, FileValueError, LoggingCliValues, MitmCliValues,
+};
 
 /// Default bind address.
 pub const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -52,10 +55,7 @@ pub const DEFAULT_MITM_CERT_CACHE_MAX_ENTRIES: usize = 10_240;
 /// leading `v` (pre-release suffixes such as `-beta.1` included); any other build reports
 /// the `Cargo.toml` version with a `-dev` suffix.
 pub fn app_version() -> &'static str {
-    match option_env!("CONDUIT_RELEASE_VERSION") {
-        Some(version) if !version.is_empty() => version,
-        _ => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
-    }
+    rusty_conduit_engine::app_version!()
 }
 
 /// Errors raised while loading or validating configuration. Every variant is `FATAL`.
@@ -365,37 +365,8 @@ pub struct FileConfig {
     pub logging: FileLoggingConfig,
 }
 
-/// `[mitm]` table of the TOML configuration file.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct FileMitmConfig {
-    pub ca_cert: Option<PathBuf>,
-    pub ca_key: Option<PathBuf>,
-    pub ca_p12: Option<PathBuf>,
-    pub ca_passphrase: Option<String>,
-    pub ca_passphrase_file: Option<PathBuf>,
-    /// Human-readable duration such as `30m`, `1h`, or `3600s`.
-    pub cert_ttl: Option<String>,
-    pub cert_cache_max_entries: Option<usize>,
-    /// Destinations (IP, CIDR, FQDN, or `*.domain`) whose upstream TLS certificates are not verified.
-    #[serde(default)]
-    pub insecure_hosts: Vec<String>,
-    /// Blind trust: skip upstream TLS certificate verification for every MITM target (unsafe).
-    pub insecure: Option<bool>,
-    /// Destinations (IP, CIDR, FQDN, or `*.domain`) excluded from MITM interception.
-    #[serde(default)]
-    pub bypass_hosts: Vec<String>,
-}
-
-/// `[logging]` table of the TOML configuration file.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct FileLoggingConfig {
-    pub level: Option<String>,
-    pub format: Option<String>,
-    pub http_access_log: Option<PathBuf>,
-    pub socks_log: Option<PathBuf>,
-}
+/// The `[mitm]` and `[logging]` tables, shared with the other rusty-conduit CLIs.
+pub use rusty_conduit_engine::cli_support::file::{FileLoggingConfig, FileMitmConfig};
 
 impl FileConfig {
     /// Parse TOML text.
@@ -463,6 +434,8 @@ pub struct Config {
     pub socks_log: Option<PathBuf>,
     /// The passphrase was supplied as a CLI argument (triggers an `INFO` notice).
     pub passphrase_from_cli: bool,
+    /// Notices produced while merging the config file (for example a deprecated key).
+    pub file_notices: Vec<String>,
 }
 
 impl fmt::Debug for Config {
@@ -501,6 +474,7 @@ impl fmt::Debug for Config {
             .field("http_access_log", &self.http_access_log)
             .field("socks_log", &self.socks_log)
             .field("passphrase_from_cli", &self.passphrase_from_cli)
+            .field("file_notices", &self.file_notices)
             .finish()
     }
 }
@@ -535,6 +509,7 @@ impl Default for Config {
             http_access_log: None,
             socks_log: None,
             passphrase_from_cli: false,
+            file_notices: Vec::new(),
         }
     }
 }
@@ -556,37 +531,42 @@ impl Config {
         let d = Config::default();
         let a = cli.args;
 
-        let file_ttl = file_duration("mitm.cert_ttl", file.mitm.cert_ttl.as_deref())?;
+        let file_value = |e: FileValueError| ConfigError::InvalidFileValue {
+            key: e.key,
+            message: e.message,
+        };
+        let mitm = merge_mitm(
+            MitmCliValues {
+                ca_cert: a.mitm_ca_cert,
+                ca_key: a.mitm_ca_key,
+                ca_p12: a.mitm_ca_p12,
+                ca_passphrase: a.mitm_ca_passphrase,
+                ca_passphrase_file: a.mitm_ca_passphrase_file,
+                cert_ttl: a.mitm_cert_ttl,
+                cert_cache_max_entries: a.mitm_cert_cache_max_entries,
+                insecure_hosts: a.mitm_insecure_host,
+                bypass_hosts: a.mitm_bypass_host,
+                insecure: a.mitm_insecure,
+            },
+            Some(file.mitm),
+        )
+        .map_err(file_value)?;
         let file_keepalive = file_duration("tcp_keepalive", file.tcp_keepalive.as_deref())?;
         let file_keepalive_interval = file_duration(
             "tcp_keepalive_interval",
             file.tcp_keepalive_interval.as_deref(),
         )?;
-        let file_level = file
-            .logging
-            .level
-            .as_deref()
-            .map(|s| {
-                s.parse::<LogLevel>()
-                    .map_err(|e| ConfigError::InvalidFileValue {
-                        key: "logging.level",
-                        message: e,
-                    })
-            })
-            .transpose()?;
-        let file_format = file
-            .logging
-            .format
-            .as_deref()
-            .map(|s| {
-                s.parse::<LogFormat>()
-                    .map_err(|e| ConfigError::InvalidFileValue {
-                        key: "logging.format",
-                        message: e,
-                    })
-            })
-            .transpose()?;
-
+        // After the keepalive keys, so file errors are reported in the former order.
+        let logging = merge_logging(
+            LoggingCliValues {
+                level: a.log_level,
+                format: a.log_format,
+                http_access_log: a.http_access_log,
+                socks_log: a.socks_log,
+            },
+            Some(file.logging),
+        )
+        .map_err(file_value)?;
         let socks_block_web = if cli.socks_block_web_explicit {
             cli.socks_block_web_value
         } else {
@@ -604,18 +584,6 @@ impl Config {
         } else {
             a.block
         };
-        let mitm_insecure_hosts = if a.mitm_insecure_host.is_empty() {
-            file.mitm.insecure_hosts
-        } else {
-            a.mitm_insecure_host
-        };
-        let mitm_bypass_hosts = if a.mitm_bypass_host.is_empty() {
-            file.mitm.bypass_hosts
-        } else {
-            a.mitm_bypass_host
-        };
-        let mitm_insecure = a.mitm_insecure || file.mitm.insecure.unwrap_or(false);
-
         Ok(Config {
             config_path: a.config,
             bind: a.bind.or(file.bind).unwrap_or(d.bind),
@@ -639,26 +607,24 @@ impl Config {
                 .unwrap_or(d.tcp_keepalive_retries),
             allow,
             block,
-            mitm_ca_cert: a.mitm_ca_cert.or(file.mitm.ca_cert),
-            mitm_ca_key: a.mitm_ca_key.or(file.mitm.ca_key),
-            mitm_ca_p12: a.mitm_ca_p12.or(file.mitm.ca_p12),
-            mitm_ca_passphrase: a.mitm_ca_passphrase.or(file.mitm.ca_passphrase),
-            mitm_ca_passphrase_file: a.mitm_ca_passphrase_file.or(file.mitm.ca_passphrase_file),
-            mitm_cert_ttl: a.mitm_cert_ttl.or(file_ttl).unwrap_or(d.mitm_cert_ttl),
-            mitm_cert_cache_max_entries: a
-                .mitm_cert_cache_max_entries
-                .or(file.mitm.cert_cache_max_entries)
-                .unwrap_or(d.mitm_cert_cache_max_entries),
-            mitm_insecure_hosts,
-            mitm_bypass_hosts,
-            mitm_insecure,
+            mitm_ca_cert: mitm.ca_cert,
+            mitm_ca_key: mitm.ca_key,
+            mitm_ca_p12: mitm.ca_p12,
+            mitm_ca_passphrase: mitm.ca_passphrase,
+            mitm_ca_passphrase_file: mitm.ca_passphrase_file,
+            mitm_cert_ttl: mitm.cert_ttl,
+            mitm_cert_cache_max_entries: mitm.cert_cache_max_entries,
+            mitm_insecure_hosts: mitm.insecure_hosts,
+            mitm_bypass_hosts: mitm.bypass_hosts,
+            mitm_insecure: mitm.insecure,
             socks_block_web,
             error_page: a.error_page.or(file.error_page),
-            log_level: a.log_level.or(file_level).unwrap_or(d.log_level),
-            log_format: a.log_format.or(file_format).unwrap_or(d.log_format),
-            http_access_log: a.http_access_log.or(file.logging.http_access_log),
-            socks_log: a.socks_log.or(file.logging.socks_log),
+            log_level: logging.level,
+            log_format: logging.format,
+            http_access_log: logging.http_access_log,
+            socks_log: logging.socks_log,
             passphrase_from_cli: cli.passphrase_from_cli,
+            file_notices: mitm.notices,
         })
     }
 
@@ -921,6 +887,7 @@ impl Config {
                     .to_string(),
             );
         }
+        out.extend(self.file_notices.iter().cloned());
         out
     }
 
@@ -1942,6 +1909,49 @@ allow = ["example.com", "192.168.0.0/16"]
         )
         .unwrap();
         assert_eq!(file.mitm.bypass_hosts, vec!["x.example"]);
+    }
+
+    #[test]
+    fn deprecated_cert_cache_max_key_is_accepted_with_a_notice() {
+        let _env = EnvGuard::new(&[]);
+        let path = temp_file("[mitm]\ncert_cache_max = 77\n");
+        let p = path.to_str().unwrap();
+        let cfg = load(&["--config", p]).unwrap();
+        assert_eq!(cfg.mitm_cert_cache_max_entries, 77);
+        let notices = cfg.notices();
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.contains("mitm.cert_cache_max is deprecated")),
+            "{notices:?}"
+        );
+        let _ = fs::remove_file(&path);
+
+        // The current key wins over the deprecated one; the notice is still shown.
+        let path = temp_file("[mitm]\ncert_cache_max = 77\ncert_cache_max_entries = 88\n");
+        let p = path.to_str().unwrap();
+        let cfg = load(&["--config", p]).unwrap();
+        assert_eq!(cfg.mitm_cert_cache_max_entries, 88);
+        assert_eq!(cfg.file_notices.len(), 1);
+        // And the command line wins over both.
+        let cfg = load(&["--config", p, "--mitm-cert-cache-max-entries", "99"]).unwrap();
+        assert_eq!(cfg.mitm_cert_cache_max_entries, 99);
+        let _ = fs::remove_file(&path);
+
+        let cfg = load(&[]).unwrap();
+        assert!(cfg.file_notices.is_empty());
+    }
+
+    #[test]
+    fn file_config_debug_hides_the_ca_passphrase() {
+        let file = FileConfig::from_toml_str(
+            "[mitm]\nca_passphrase = \"file-canary-secret\"\n",
+            Path::new("x.toml"),
+        )
+        .unwrap();
+        let rendered = format!("{file:?}");
+        assert!(!rendered.contains("file-canary-secret"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 
     #[test]

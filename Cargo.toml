@@ -17,7 +17,7 @@ path = "src/main.rs"
 # Shared proxy engine (listeners, mux, HTTP/SOCKS, MITM, filter, logging); its modules are
 # re-exported from the crate root. `default-features = false` drops the regex-based
 # `routing` feature: rusty-conduit always routes `direct` with no rules.
-rusty-conduit-engine = { git = "https://github.com/jpbaking/rusty-conduit-engine", tag = "v0.6.0", default-features = false }
+rusty-conduit-engine = { git = "https://github.com/jpbaking/rusty-conduit-engine", rev = "05485a4c0fdd5315e4e6954a199a55d34cd17bc1", default-features = false, features = ["cli-support"] }
 
 # Async runtime & utilities
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs", "io-std"] }
@@ -32,10 +32,11 @@ humantime = "2"
 thiserror = "2"
 
 [target.'cfg(unix)'.dependencies]
-rlimit = "0.12"
 libc = "0.2"
 
 [dev-dependencies]
+# Shared unit-test fixtures (test CA, echo/origin servers, TLS client, log capture).
+rusty-conduit-engine = { git = "https://github.com/jpbaking/rusty-conduit-engine", rev = "05485a4c0fdd5315e4e6954a199a55d34cd17bc1", default-features = false, features = ["cli-support", "test-support"] }
 # Integration-test fixtures (origin servers, MITM/TLS clients, CA generation). The engine
 # owns the runtime HTTP/TLS stack; these stay pure-Rust (`ring` provider, no OpenSSL / aws-lc).
 tokio-util = { version = "0.7", features = ["rt"] }

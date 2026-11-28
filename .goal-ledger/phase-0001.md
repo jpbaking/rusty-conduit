@@ -1,92 +1,54 @@
-# phase-0001 — Release profile and malloc arena cap
+# phase-0001 — Pin the engine by rev with the cli-support and test-support features
 
 - Status: done
 - Owner: executor
 - Depends on: none
-- Goal: Add an optimized `[profile.release]` and cap glibc malloc arenas at 2 on Linux when `MALLOC_ARENA_MAX` is unset, and say so in the sizing guide.
-- Done when: `cargo test --locked` passes, `Cargo.toml` has the exact release profile from sub-task 1, `src/main.rs` matches sub-task 2, and the sizing guide sentence from sub-task 3 is in place.
-- Pattern to follow: `Dockerfile:36-39` (the comment explaining why `MALLOC_ARENA_MAX=2` is set; reuse its reasoning in the code comment)
+- Goal: Build against the untagged engine `main` (`05485a4…`) with the `cli-support` feature for the binary and `test-support` for tests, with no other code change.
+- Done when: every command in `## Verify` exits 0.
+- Pattern to follow: `Cargo.toml:20` (the current engine dependency line)
 
 ## Context
-Release builds currently use Cargo defaults (`lto = false`, `codegen-units = 16`, no strip), so nothing is inlined across the `rusty-conduit-engine` crate boundary. The planner chose `lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`; do not pick other values.
-glibc gives every worker thread its own malloc arena; on many-core Linux that costs ~220 KB per open tunnel instead of ~26 KB. Only the Docker image sets `MALLOC_ARENA_MAX=2` today. glibc reads `MALLOC_ARENA_MAX` itself at startup, so when the variable is set the binary must leave it alone.
-`libc` is already a `[target.'cfg(unix)'.dependencies]` entry in `Cargo.toml`, and the bin target can use it. `libc::mallopt` and `libc::M_ARENA_MAX` exist only for `target_os = "linux"` + `target_env = "gnu"`; that code is not compiled on macOS, so the planner checks it in a Linux container afterwards.
+The engine is not tagged until every optimization is done (user decision), so consumers pin its commit. A trial build with only the pin changed passed clippy and all tests, so no source change is expected in this phase. `default-features = false` stays (rusty-conduit never uses regex routing). Cargo merges the features of a dependency declared in both `[dependencies]` and `[dev-dependencies]` when the source and `rev` match exactly.
 
 ## Scope
-- In: `Cargo.toml`, `src/main.rs`, `docs/PERFORMANCE-AND-SIZING.md`
-- Out: `src/lib.rs`, `Dockerfile` (keep its `ENV MALLOC_ARENA_MAX=2`), `Cargo.lock`, `.github/`, every other doc
+- In: `Cargo.toml`, `Cargo.lock`, `DOX.md` (the "Engine lives elsewhere" bullet only)
+- Out: `src/`, `tests/`, `.github/`, every other doc
 
 ## Sub-tasks
-1. [done] Append this block at the very end of `Cargo.toml`, after a blank line, exactly: (block 1 below) — done when: `grep -c '^\[profile.release\]' Cargo.toml` prints `1` and `cargo build --locked` succeeds.
-   Block 1:
-   ```toml
-   # Thin LTO with one codegen unit inlines across the rusty-conduit-engine crate boundary;
-   # stripped symbols keep the release binary and image small.
-   [profile.release]
-   lto = "thin"
-   codegen-units = 1
-   strip = "symbols"
-   ```
-2. [done] Replace the whole of `src/main.rs` with exactly: (block 1 below) — done when: `cargo build --locked` succeeds and `grep -c 'libc::mallopt(libc::M_ARENA_MAX, 2)' src/main.rs` prints `1`.
-   Block 1:
-   ```rust
-   use std::process::ExitCode;
-
-   fn main() -> ExitCode {
-       cap_malloc_arenas();
-       rusty_conduit::main_entry()
-   }
-
-   /// glibc gives every worker thread its own malloc arena, which multiplies memory on hosts with
-   /// many CPUs (about 8x per open connection); two arenas keep it low with no measurable
-   /// throughput cost. glibc applies an explicit `MALLOC_ARENA_MAX` itself, so that one wins.
-   #[cfg(all(target_os = "linux", target_env = "gnu"))]
-   fn cap_malloc_arenas() {
-       if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
-           // SAFETY: runs first in `main`, before any other thread exists; `mallopt` takes
-           // integer arguments and touches no Rust-managed memory.
-           unsafe {
-               libc::mallopt(libc::M_ARENA_MAX, 2);
-           }
-       }
-   }
-
-   #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-   fn cap_malloc_arenas() {}
-   ```
-3. [done] In `docs/PERFORMANCE-AND-SIZING.md`, replace exactly this text: `The container image sets `MALLOC_ARENA_MAX=2`. For the prebuilt Linux binaries, set it in the environment (for example `Environment=MALLOC_ARENA_MAX=2` in a `systemd` unit) to get the low figures on any CPU count.` with exactly: `On Linux, the binary caps glibc at two arenas itself when `MALLOC_ARENA_MAX` is not set, so the prebuilt binaries and the container image (which also sets `MALLOC_ARENA_MAX=2`) get the low figures on any CPU count. Set `MALLOC_ARENA_MAX` to another value to override it.` Change nothing else in the file — done when: `grep -c 'caps glibc at two arenas itself' docs/PERFORMANCE-AND-SIZING.md` prints `1` and `grep -c 'For the prebuilt Linux binaries, set it' docs/PERFORMANCE-AND-SIZING.md` prints `0`.
+1. [done] In `Cargo.toml`, replace line 20 exactly with: `rusty-conduit-engine = { git = "https://github.com/jpbaking/rusty-conduit-engine", rev = "05485a4c0fdd5315e4e6954a199a55d34cd17bc1", default-features = false, features = ["cli-support"] }` — done when: `grep -c 'rev = "05485a4c0fdd5315e4e6954a199a55d34cd17bc1"' Cargo.toml` prints `1`.
+2. [done] In `Cargo.toml`, insert directly below the `[dev-dependencies]` header these two lines: `# Shared unit-test fixtures (test CA, echo/origin servers, TLS client, log capture).` and `rusty-conduit-engine = { git = "https://github.com/jpbaking/rusty-conduit-engine", rev = "05485a4c0fdd5315e4e6954a199a55d34cd17bc1", default-features = false, features = ["cli-support", "test-support"] }` — done when: `grep -c 'rev = "05485a4c0fdd5315e4e6954a199a55d34cd17bc1"' Cargo.toml` prints `2`.
+3. [done] Run `cargo update -p rusty-conduit-engine` once (no other `cargo update`) — done when: `cargo build --locked` succeeds and `git diff Cargo.lock | grep -c '^[-+]source = "git+https://github.com/jpbaking/rusty-conduit-engine'` prints `2` (one removed tag source, one added rev source).
+4. [done] In `DOX.md` (line 220), replace exactly `pinned by tag in \`Cargo.toml\`, with \`default-features = false\` (no regex \`routing\` feature)` with `pinned in \`Cargo.toml\` (by \`rev\` until the engine's \`v0.7.0\` tag), with \`default-features = false\` (no regex \`routing\` feature) and the \`cli-support\` feature (plus \`test-support\` for tests)` — done when: `grep -c 'by `rev` until the engine' DOX.md` prints `1`.
 
 ## Verify
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
-grep -c '^\[profile.release\]' Cargo.toml
-grep -c 'caps glibc at two arenas itself' docs/PERFORMANCE-AND-SIZING.md
-git diff --exit-code -- Cargo.lock src/lib.rs Dockerfile
+python3 scripts/check-pure-rust-crypto.py
+test "$(grep -c 'rev = "05485a4c0fdd5315e4e6954a199a55d34cd17bc1"' Cargo.toml)" = 2
+git diff --exit-code -- src tests .github
 ```
-- manual (planner only, needs Docker): `docker run --rm -v "$PWD":/src -w /src rust:1-bookworm cargo clippy --bins --locked -- -D warnings` exits 0, which compiles the Linux-only branch.
 
 ## Escalate when
-- `cargo build --locked` fails because `Cargo.lock` would change → stop, set Status: needs-human — reason: paste the error (no new dependency should be needed).
-- The sentence in sub-task 3 is not found verbatim → stop, set Status: needs-human — reason: paste the paragraph under "Memory on many-core Linux" as it is now.
-- clippy reports a lint on the new code → stop, set Status: needs-human — reason: paste the lint; do not add `#[allow]`.
+- `cargo update -p rusty-conduit-engine` changes any package other than the engine and crates it newly pulls in (for example `rlimit`'s own dependencies) → stop, set Status: needs-human — reason: paste `git diff --stat Cargo.lock` and the changed package names.
+- Build, clippy, or a test fails → stop, set Status: needs-human — reason: paste the first error (the trial build passed, so this is unexpected).
+- `check-pure-rust-crypto.py` reports a banned crate → stop, set Status: needs-human — reason: paste its output.
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: appended `[profile.release]` (`lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`) to `Cargo.toml`
-- sub-task 2: replaced `src/main.rs` to call `cap_malloc_arenas()` using `libc::mallopt(libc::M_ARENA_MAX, 2)` on Linux glibc when `MALLOC_ARENA_MAX` is unset
-- sub-task 3: updated the `MALLOC_ARENA_MAX` sentence in `docs/PERFORMANCE-AND-SIZING.md`
-- phase-0001 verified and closed (manual Docker Linux clippy check remains for planner)
-- planner accepted phase-0001: re-ran ## Verify (104 passed), read the close-commit diff (in scope, matches the plan verbatim), ran the manual Linux clippy check
+- sub-task 1: replaced `Cargo.toml:20` with rev pin `05485a4c0fdd5315e4e6954a199a55d34cd17bc1` and `features = ["cli-support"]`.
+- sub-task 2: inserted `rusty-conduit-engine` with `cli-support` and `test-support` features directly under `[dev-dependencies]` in `Cargo.toml`.
+- sub-task 3: ran `cargo update -p rusty-conduit-engine`; only `rusty-conduit-engine` changed in `Cargo.lock` (+3/-1 lines) and `cargo build --locked` succeeded.
+- sub-task 4: updated `DOX.md:220` "Engine lives elsewhere" bullet to document the `rev` pin and `cli-support` / `test-support` features.
+- verify: all 6 `## Verify` commands exited 0; closing phase-0001.
+
+- planner accepted phase-0001: Cargo.lock diff is the engine source line plus its new `libc` / `rlimit` edges only; DOX line correct; Verify re-run (104 passed, clippy clean, PURE_RUST_CRYPTO_OK)
 
 ## Evidence
 - (append-only: command → observed result)
-- `grep -c '^\[profile.release\]' Cargo.toml && cargo build --locked` → `1` and `Finished dev profile [unoptimized + debuginfo] target(s) in 0.23s` (exit 0)
-- `cargo build --locked && grep -c 'libc::mallopt(libc::M_ARENA_MAX, 2)' src/main.rs` → `Finished dev profile [unoptimized + debuginfo] target(s) in 0.71s` and `1` (exit 0)
-- `grep -c 'caps glibc at two arenas itself' docs/PERFORMANCE-AND-SIZING.md` → `1`; `grep -c 'For the prebuilt Linux binaries, set it' docs/PERFORMANCE-AND-SIZING.md` → `0`
-- `cargo fmt --check` → exit 0 (no output)
-- `cargo clippy --all-targets --locked -- -D warnings` → exit 0 (`Finished dev profile`)
-- `cargo test --locked` → exit 0 (62 unit + 3 cli_contract + 3 filter_proxy + 7 http_proxy + 5 mitm_proxy + 9 mux_port + 9 socks_proxy + 6 validate_cmd = 104 passed, 0 failed)
-- `grep -c '^\[profile.release\]' Cargo.toml` → `1`; `grep -c 'caps glibc at two arenas itself' docs/PERFORMANCE-AND-SIZING.md` → `1`; `git diff --exit-code -- Cargo.lock src/lib.rs Dockerfile` → exit 0
-- planner (claude-opus-5-5): `docker run --rm -v <workspace>:/ws -w /ws/rusty-conduit rust:1-bookworm sh -c 'rustup component add clippy && cargo clippy --bins --locked -- -D warnings'` → exit 0 (Linux glibc branch compiles clean; the image needs the clippy component added)
+- `grep -c 'rev = "05485a4c0fdd5315e4e6954a199a55d34cd17bc1"' Cargo.toml` → `1` (exit 0)
+- `grep -c 'rev = "05485a4c0fdd5315e4e6954a199a55d34cd17bc1"' Cargo.toml` → `2` (exit 0)
+- `cargo update -p rusty-conduit-engine && cargo build --locked && git diff Cargo.lock | grep -c '^[-+]source = "git+https://github.com/jpbaking/rusty-conduit-engine'` → built cleanly (2.81s), `2` (exit 0); `git diff --stat Cargo.lock`: `1 file changed, 3 insertions(+), 1 deletion(-)` (only `rusty-conduit-engine` source/deps changed)
+- `grep -c 'by \`rev\` until the engine' DOX.md` → `1` (exit 0)
+- `cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked && python3 scripts/check-pure-rust-crypto.py && test "$(grep -c 'rev = "05485a4c0fdd5315e4e6954a199a55d34cd17bc1"' Cargo.toml)" = 2 && git diff --exit-code -- src tests .github` → all exit 0; clippy clean, 104 tests passed (0 failed, 0 ignored), `PURE_RUST_CRYPTO_OK`, no diff in `src/`, `tests/`, `.github/`
