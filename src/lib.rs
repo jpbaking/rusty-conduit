@@ -45,10 +45,7 @@ pub fn load_config(cli: CliInput) -> Result<Config, (config::ConfigError, LogLev
 
 /// Emit the startup banner, configuration summary, `INFO` notices, and MITM upstream-TLS warnings.
 pub fn log_startup(cfg: &Config, logger: &Logger) {
-    logger.info(format!(
-        "rusty-conduit v{} starting",
-        env!("CARGO_PKG_VERSION")
-    ));
+    logger.info(format!("rusty-conduit v{} starting", config::app_version()));
     logger.info(format!("config: {}", cfg.summary()));
     for notice in cfg.notices() {
         logger.info(notice);

@@ -53,6 +53,8 @@ cd rusty-conduit
 cargo install --path .
 ```
 
+Check which version you have with `rusty-conduit --version`. Release binaries and images report the release tag (for example `rusty-conduit 2.3.0` or `rusty-conduit 2.3.0-beta.1`); a build from source reports the crate version with a `-dev` suffix (`rusty-conduit 2.3.0-dev`).
+
 ---
 
 ## 2. Start the Proxy

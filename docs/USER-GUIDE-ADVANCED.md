@@ -41,6 +41,7 @@ Settings are merged in strict order (higher overrides lower):
 | `--mitm-cert-cache-max-entries <N>` | `RUSTY_CONDUIT_MITM_CERT_CACHE_MAX_ENTRIES` | `mitm.cert_cache_max_entries` | `10240` | Max cached MITM leaf certs (`0` = unlimited) |
 | `--mitm-insecure-host <RULE>` | `RUSTY_CONDUIT_MITM_INSECURE_HOST` | `mitm.insecure_hosts` | *(none)* | Under MITM, accept invalid/self-signed upstream TLS certs for matching destinations (IP, CIDR, FQDN, or `*.domain`; same syntax as `--allow`); repeatable or comma-separated; CLI/env replaces the TOML list |
 | `--mitm-insecure` | `RUSTY_CONDUIT_MITM_INSECURE` | `mitm.insecure` | `false` | **Unsafe** blind trust: skip upstream TLS certificate verification for ALL MITM targets; enabled if set in CLI/env **or** TOML; takes precedence over `--mitm-insecure-host` |
+| `--mitm-bypass-host <RULE>` | `RUSTY_CONDUIT_MITM_BYPASS_HOST` | `mitm.bypass_hosts` | *(none)* | Under MITM, do **not** intercept `CONNECT`s whose target host matches (IP, CIDR, FQDN, or `*.domain`; same syntax as `--allow`): they get an opaque tunnel instead ([Excluding hosts from MITM](#excluding-hosts-from-mitm)); repeatable or comma-separated; CLI/env replaces the TOML list |
 | `--socks-block-web` | `RUSTY_CONDUIT_SOCKS_BLOCK_WEB` | `socks_block_web` | `false` | Reject HTTP/HTTPS traffic over SOCKS4/4a/5 (works with or without MITM). |
 | `--error-page <PATH>` | `RUSTY_CONDUIT_ERROR_PAGE` | `error_page` | *(built-in page)* | HTML template for proxy-generated HTTP error pages (placeholders `{{status}}`, `{{reason}}`, `{{message}}`, `{{target}}`); upstream responses are never altered ([section 7](#7-custom-proxy-error-pages)) |
 | `--log-level <LEVEL>` | `RUSTY_CONDUIT_LOG_LEVEL` | `logging.level` | `INFO` | `QUIET`, `FATAL`, `ERROR`, `INFO`, `DEBUG`, `VERBOSE` (case-insensitive) |
@@ -79,6 +80,8 @@ cert_cache_max_entries = 10240
 # insecure_hosts = ["dev.internal", "*.lab.example", "10.20.0.0/16"]
 # UNSAFE: skip upstream TLS verification for every destination:
 # insecure = false
+# Never intercept these (pinned apps, banking, health): opaque CONNECT tunnel instead:
+# bypass_hosts = ["*.bank.example", "pinned.example", "203.0.113.0/24"]
 
 [logging]
 level = "INFO"
@@ -104,6 +107,7 @@ rusty-conduit --config /etc/rusty-conduit/rusty-conduit.toml --http-port 8080
 - Supplying both `--mitm-ca-passphrase` and `--mitm-ca-passphrase-file`.
 - `--mitm-cert-ttl` shorter than `10s`.
 - An invalid `--mitm-insecure-host` / `mitm.insecure_hosts` rule.
+- An invalid `--mitm-bypass-host` / `mitm.bypass_hosts` rule.
 - `--tcp-keepalive` not `0` and outside `1s`–`32767s`; or, while keepalive is enabled, `--tcp-keepalive-interval` outside `1s`–`32767s` or `--tcp-keepalive-retries` outside `1`–`127`.
 - Unreadable, expired, not-yet-valid, or mismatched CA cert/key, wrong PKCS#12 passphrase, or legacy `Proc-Type: 4,ENCRYPTED` PEM key.
 - Port bind failure or unopenable log file path.
@@ -165,6 +169,21 @@ RUSTY_CONDUIT_MITM_CA_PASSPHRASE='...' rusty-conduit \
   - `--mitm-insecure` accepts any upstream cert for every target (blind trust). Use it only on isolated test networks: anyone on the path to the origin can impersonate it.
 - Supports HTTP/1.1, HTTP/2 (mirroring upstream ALPN), and `101 Switching Protocols` upgrades (e.g., WebSocket) with zero response caching.
 - Logs every decrypted request with `proto=https mitm=true` and the full `https://` URL.
+
+### Excluding hosts from MITM
+
+`--mitm-bypass-host <RULE>` (env `RUSTY_CONDUIT_MITM_BYPASS_HOST`, TOML `[mitm] bypass_hosts = [...]`) lists destinations that are never intercepted, for example certificate-pinned apps or banking and health sites:
+
+```sh
+rusty-conduit --mitm-ca-p12 ca.p12 \
+  --mitm-bypass-host '*.bank.example,pinned.example' \
+  --mitm-bypass-host 203.0.113.0/24
+```
+
+- A matching `CONNECT` gets the same opaque tunnel as without MITM: no leaf certificate is signed, the client sees the origin's real certificate, and the access log records `mitm=false`.
+- Rules use the `--allow` syntax: exact domain, `*.domain`, IP, or CIDR. They match the `CONNECT` target host as the client sent it, with no DNS lookup, so an IP or CIDR rule matches only clients that `CONNECT` to an IP literal.
+- The bypass list does not relax anything: `--allow` / `--block` still apply to bypassed targets, and `--mitm-insecure-host` / `--mitm-insecure` concern only intercepted targets.
+- Repeat the flag or separate rules with commas; a CLI or env list replaces the TOML list. An invalid rule is a `FATAL` startup error. The startup `config:` line shows the rule count as `mitm_bypass_hosts=N`.
 
 ---
 

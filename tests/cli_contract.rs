@@ -89,6 +89,17 @@ fn binary_help_and_exit_codes() {
     let (code, out, _) = run(&["--help"]);
     assert_eq!(code, Some(0));
     assert!(out.contains("--tcp-keepalive <DURATION>"), "{out}");
+    let (code, out, _) = run(&["--version"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        out.trim(),
+        format!("rusty-conduit {}", rusty_conduit::config::app_version())
+    );
+    assert!(
+        out.trim()
+            .starts_with(concat!("rusty-conduit ", env!("CARGO_PKG_VERSION"))),
+        "{out}"
+    );
     let (code, _, _) = run(&["--no-such-flag"]);
     assert_eq!(code, Some(2), "usage errors exit 2");
     let missing =

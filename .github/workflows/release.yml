@@ -74,8 +74,29 @@ jobs:
         with:
           key: release-${{ matrix.pkg }}
 
+      # `--version` reports the tag (without its leading `v`, pre-release suffix included)
+      # through the compile-time CONDUIT_RELEASE_VERSION. Bash runs on every matrix runner
+      # (Git Bash on Windows); GITHUB_ENV carries the value into the build step.
+      - name: Derive release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          BASE="${VERSION%%-*}"
+          CRATE="$(tr -d '\r' < Cargo.toml | sed -n 's/^version = "\(.*\)"$/\1/p' | head -n 1)"
+          if [ "${BASE}" != "${CRATE}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} (base ${BASE}) does not match Cargo.toml version ${CRATE}"
+            exit 1
+          fi
+          echo "CONDUIT_RELEASE_VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "release version: ${VERSION}"
+
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${CONDUIT_RELEASE_VERSION}"
+          cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package archive (Unix)
         if: matrix.archive == 'tar.gz'
@@ -135,9 +156,15 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
+          # A `-` suffix (e.g. v2.3.0-beta.1) marks a pre-release.
+          PRERELEASE=""
+          if [[ "${TAG#v}" == *-* ]]; then
+            PRERELEASE="--prerelease"
+          fi
           gh release create "${TAG}" dist/* \
             --title "rusty-conduit ${TAG}" \
-            --generate-notes
+            --generate-notes \
+            ${PRERELEASE:+"${PRERELEASE}"}
 
   docker:
     name: Publish Docker Image (GHCR)

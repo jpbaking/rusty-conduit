@@ -173,6 +173,10 @@ Rules for the CA options:
 Upstream (origin) certificates are always checked against the operating system's trust store,
 so interception never hides an invalid origin certificate from you.
 
+To leave certificate-pinned apps or sensitive sites (banking, health) uninspected, list them with
+`--mitm-bypass-host` (TOML `[mitm] bypass_hosts`); they get an opaque tunnel and keep the origin's
+real certificate. See [Excluding hosts from MITM](USER-GUIDE-ADVANCED.md#excluding-hosts-from-mitm).
+
 ---
 
 ## 4. Trusting the CA
