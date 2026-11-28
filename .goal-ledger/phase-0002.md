@@ -1,49 +1,66 @@
-# phase-0002 — Add the validate subcommand
+# phase-0002 — Pure-Rust crypto CI gate and CLI contract rows
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0001
-- Goal: `rusty-conduit validate` loads, merges, and validates the configuration exactly as startup does, without binding any listener, and exits 0 or 1.
-- Done when: `cargo test --locked` passes, including the new `tests/validate_cmd.rs`.
-- Pattern to follow: `../rusty-conduit-ssh/src/lib.rs` `cmd_validate` and its dispatch in `main_entry`, and `../rusty-conduit-ssh/tests/validate_cmd.rs` (read only; both exist once the rusty-conduit-ssh goal finished its phase-0002). Same shape in `../rusty-conduit-switch/src/lib.rs:268-300`.
+- Goal: Run the engine's pure-Rust crypto check in CI and release verification, and lock the four missing shared flags in `tests/cli_contract.rs`.
+- Done when: `python3 scripts/check-pure-rust-crypto.py` prints `PURE_RUST_CRYPTO_OK`, both workflows run it, and `cargo test --locked --test cli_contract` passes with the four new rows.
+- Pattern to follow: `../rusty-conduit-engine/.github/workflows/ci.yml:26` (the `- run: python3 scripts/check-pure-rust-crypto.py` step) and `tests/cli_contract.rs:30` (one `SHARED_FLAGS` row)
 
 ## Context
-All three tools now share `validate`: success prints `config OK: <config path or none>` to stdout followed by any NOTICE lines and exits 0; failure prints `config invalid: <error>` to stderr and exits 1. As in rusty-conduit-ssh, a config file is optional (everything can come from flags and env). rusty-conduit has no positional arguments, so `Validate` is a unit variant. `--config` must be `global = true` so `validate --config x.toml` works. Adding a subcommand changes the usage line to `rusty-conduit [OPTIONS] [COMMAND]`; that is expected.
+Product invariant: `openssl-sys` and `aws-lc-sys` must never enter the dependency graph. The engine and the GUI enforce it with `scripts/check-pure-rust-crypto.py`; the CLIs do not. The script is generic (it runs `cargo tree --workspace --target all` from the repo root), so copy it unchanged.
+`SHARED_FLAGS` in `tests/cli_contract.rs` omits `--mitm-insecure-host`, `--mitm-bypass-host`, `--mitm-insecure`, and `--error-page`, so their help text can drift between the three CLIs. rusty-conduit's own wording is the canonical text the sibling CLIs will copy. If the help assertion for a new row fails here, the rendered text in the failure message is the canonical one: put that exact string in the row (an allowed fix-up). Do not edit `src/config.rs` to make the test pass.
 
 ## Scope
-- In: `src/config.rs`, `src/lib.rs`, `tests/validate_cmd.rs` (new)
-- Out: every other file under `tests/`, `docs/`, `README.md`, `DOX.md`
+- In: `scripts/check-pure-rust-crypto.py` (new), `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `tests/cli_contract.rs`, `DOX.md` (Verification section only)
+- Out: `src/`, `Cargo.toml`, `Cargo.lock`, `Dockerfile`, every other workflow step
 
 ## Sub-tasks
-1. [done] In `src/config.rs`: add `Subcommand` to the clap import (line 19); add `#[derive(Debug, Clone, PartialEq, Eq, Subcommand)] pub enum Command { Validate }` above `CliArgs`, with doc `/// Subcommands. Without one, the proxy runs.` and variant doc `/// Validate the configuration (flags, environment, and --config file) and exit 0/1`; add `#[command(subcommand)] pub command: Option<Command>,` as the first field of `CliArgs`; add `global = true` to the `--config` `#[arg(...)]` (line 96) — done when: `cargo build` succeeds and `cargo run -q -- validate --help` exits 0.
-2. [done] In `src/lib.rs`: add `use std::io::Write;` and `pub fn cmd_validate(cli: CliInput, out: &mut dyn Write, err: &mut dyn Write) -> u8` with doc `/// \`validate\`: exit 0 when the configuration is valid, 1 otherwise.`. Call `load_config(cli)`; on `Ok(cfg)` write `config OK: {path}` where `path` is `cfg.config_path` displayed or `none`, then each `cfg.notices()` entry on its own line, and return `0`; on `Err((e, _))` write `config invalid: {e}` to `err` and return `EXIT_FATAL` — done when: `cargo build` succeeds.
-3. [done] In `main_entry` (`src/lib.rs:257`), right after `let cli = CliInput::parse();`, add: if `cli.args.command == Some(Command::Validate)`, return `ExitCode::from(cmd_validate(cli, &mut std::io::stdout(), &mut std::io::stderr()))` — done when: `cargo run -q -- validate` prints `config OK: none` and exits 0, and `cargo run -q -- validate --bind not-an-ip` exits 2 (clap rejects the value).
-4. [done] Create `tests/validate_cmd.rs` with four tests that run `env!("CARGO_BIN_EXE_rusty-conduit")` with `RUSTY_CONDUIT_CONFIG` removed from the environment: (a) `validate` → exit 0, stdout starts with `config OK: none`; (b) a TOML file under `std::env::temp_dir()` containing `http_port = 3128` passed as `validate --config <file>` → exit 0, stdout contains `config OK:` and the file path; (c) a file containing `http_port = "nope"` → exit 1, stderr contains `config invalid:`; (d) `--no-such-flag` → exit 2. Remove the temp files at the end of each test — done when: `cargo test --locked --test validate_cmd` passes 4 tests.
+1. [done] Run `mkdir -p scripts && cp ../rusty-conduit-engine/scripts/check-pure-rust-crypto.py scripts/check-pure-rust-crypto.py && chmod 755 scripts/check-pure-rust-crypto.py` — done when: `cmp ../rusty-conduit-engine/scripts/check-pure-rust-crypto.py scripts/check-pure-rust-crypto.py` exits 0 and `python3 scripts/check-pure-rust-crypto.py` prints `PURE_RUST_CRYPTO_OK`.
+2. [done] In `.github/workflows/ci.yml`, insert the line `      - run: python3 scripts/check-pure-rust-crypto.py` directly after `      - run: cargo clippy --all-targets --locked -- -D warnings` (line 23, `lint` job). In `.github/workflows/release.yml`, insert the same line directly after `      - run: cargo test --locked` (line 27, `verify` job). Same six-space indentation as the neighbouring steps — done when: `grep -c 'check-pure-rust-crypto.py' .github/workflows/ci.yml` prints `1`, the same for `release.yml` prints `1`, and `ruby -ryaml -e 'ARGV.each { |f| YAML.load_file(f) }' .github/workflows/ci.yml .github/workflows/release.yml` exits 0.
+3. [done] In `tests/cli_contract.rs`, insert these three rows directly after the `("mitm-cert-cache-max-entries", ...)` row (line 30), exactly: (block 1 below) and this row directly after the `("socks-block-web", ...)` row, exactly: (block 2 below) — done when: `cargo test --locked --test cli_contract` passes (apply the fix-up rule in Context for a help-text mismatch).
+   Block 1:
+   ```rust
+       ("mitm-insecure-host", Some("RULE"), "Accept invalid/self-signed upstream TLS certificates under MITM for matching destinations (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated"),
+       ("mitm-bypass-host", Some("RULE"), "Exclude matching destinations (IP, CIDR, FQDN, or *.domain) from MITM interception: they get an opaque CONNECT tunnel instead; repeatable or comma-separated"),
+       ("mitm-insecure", None, "UNSAFE blind trust: skip upstream TLS certificate verification for ALL MITM targets"),
+   ```
+   Block 2:
+   ```rust
+       ("error-page", Some("PATH"), "HTML template file for proxy-generated HTTP error pages (placeholders: {{status}}, {{reason}}, {{message}}, {{target}}) [default: built-in page]"),
+   ```
+4. [done] In `DOX.md`, in the `### Verification` list (the bullets `cargo fmt --check`, `cargo clippy ...`, `cargo test --locked`), add the bullet `- `python3 scripts/check-pure-rust-crypto.py` (no `openssl-sys` or `aws-lc-sys` in any target's dependency graph)` after `cargo test --locked`. Change nothing else in `DOX.md` — done when: `grep -c 'check-pure-rust-crypto.py' DOX.md` prints `1`.
 
 ## Verify
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
-cargo run -q -- validate | grep -F 'config OK: none'
-cargo run -q -- --help | grep -F 'validate'
+python3 scripts/check-pure-rust-crypto.py
+cmp ../rusty-conduit-engine/scripts/check-pure-rust-crypto.py scripts/check-pure-rust-crypto.py
+test "$(grep -c 'check-pure-rust-crypto.py' .github/workflows/ci.yml)" = 1
+test "$(grep -c 'check-pure-rust-crypto.py' .github/workflows/release.yml)" = 1
+ruby -ryaml -e 'ARGV.each { |f| YAML.load_file(f) }' .github/workflows/ci.yml .github/workflows/release.yml
+git diff --exit-code -- src Cargo.toml Cargo.lock
 ```
 
 ## Escalate when
-- An existing test fails because the parser now has a subcommand (for example a test that builds `CliArgs` by hand without `command`) → stop, set Status: needs-human — reason: name the test and paste the error.
-- `load_config` binds a port, opens the access logs, or touches the network → stop, set Status: needs-human — reason: name the call that does it.
+- `python3 scripts/check-pure-rust-crypto.py` reports a banned crate → stop, set Status: needs-human — reason: paste its output (that is a real invariant breach, not a script problem).
+- A new contract row fails for a reason other than its help text (missing flag, hidden flag, wrong env var, wrong value name) → stop, set Status: needs-human — reason: paste the failure.
+- `../rusty-conduit-engine/scripts/check-pure-rust-crypto.py` does not exist → stop, set Status: needs-human — reason: the workspace engine checkout is missing.
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: added `Command::Validate`, `CliArgs::command`, and `global = true` on `--config` in `src/config.rs`
-- sub-task 2: added `use std::io::Write;` and `pub fn cmd_validate` in `src/lib.rs`
-- sub-task 3: dispatched `Command::Validate` to `cmd_validate` in `main_entry` (`src/lib.rs`)
-- sub-task 4: added `tests/validate_cmd.rs` with 4 binary tests and verified full `## Verify` suite passes
+- planner: sub-task 4 tightened before delegation — the `Verification (mirrors ...)` bullet it referenced does not exist; the only Verification list is `### Verification` at DOX.md:229
+- sub-task 1: copied `../rusty-conduit-engine/scripts/check-pure-rust-crypto.py` to `scripts/check-pure-rust-crypto.py` with mode 755
+- sub-task 2: added `python3 scripts/check-pure-rust-crypto.py` step to `.github/workflows/ci.yml` (`lint` job) and `.github/workflows/release.yml` (`verify` job)
+- sub-task 3: added `--mitm-insecure-host`, `--mitm-bypass-host`, `--mitm-insecure`, and `--error-page` rows to `SHARED_FLAGS` in `tests/cli_contract.rs`
+- sub-task 4: added `python3 scripts/check-pure-rust-crypto.py` bullet to `### Verification` in `DOX.md`
 
 ## Evidence
 - (append-only: command → observed result)
-- `cargo build && cargo run -q -- validate --help` → exit 0 (`Usage: rusty-conduit validate [OPTIONS]` with `--config <PATH>`)
-- `cargo build` → exit 0
-- `cargo run -q -- validate` → exit 0 (`config OK: none`); `cargo run -q -- validate --bind not-an-ip` → exit 2
-- `cargo test --locked --test validate_cmd` → exit 0 (4 passed, 0 failed)
-- `cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked && cargo run -q -- validate | grep -F 'config OK: none' && cargo run -q -- --help | grep -F 'validate'` → exit 0 (38 unit + 37 integration tests passed, 0 failed)
+- `cmp ../rusty-conduit-engine/scripts/check-pure-rust-crypto.py scripts/check-pure-rust-crypto.py && python3 scripts/check-pure-rust-crypto.py` → exit 0, `PURE_RUST_CRYPTO_OK`
+- `grep -c 'check-pure-rust-crypto.py' .github/workflows/ci.yml && grep -c 'check-pure-rust-crypto.py' .github/workflows/release.yml && ruby -ryaml -e 'ARGV.each { |f| YAML.load_file(f) }' .github/workflows/ci.yml .github/workflows/release.yml` → exit 0, `1` and `1`
+- `cargo test --locked --test cli_contract` → exit 0, 3 passed, 0 failed
+- `grep -c 'check-pure-rust-crypto.py' DOX.md` → exit 0, `1`
+- `## Verify` (`cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked`, `python3 scripts/check-pure-rust-crypto.py`, `cmp`, workflow grep counts = 1, ruby YAML parse, `git diff --exit-code -- src Cargo.toml Cargo.lock`) → exit 0 (104 passed, 0 failed; `PURE_RUST_CRYPTO_OK`)

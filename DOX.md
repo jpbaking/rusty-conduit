@@ -233,6 +233,7 @@ Run from the project root (matches `.github/workflows/ci.yml`):
 - `cargo fmt --check`
 - `cargo clippy --all-targets --locked -- -D warnings`
 - `cargo test --locked`
+- `python3 scripts/check-pure-rust-crypto.py` (no `openssl-sys` or `aws-lc-sys` in any target's dependency graph)
 
 Docker image build: `docker build .` (CI builds the default target). Releases are cut by pushing a `v*` tag (`.github/workflows/release.yml`): the tag's `X.Y.Z` base must equal the `Cargo.toml` version (the build fails otherwise), every matrix build compiles with `CONDUIT_RELEASE_VERSION` set to the tag without its leading `v`, and a tag with a `-` pre-release suffix (for example `v2.3.0-beta.1`) publishes a GitHub pre-release.
 

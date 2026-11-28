@@ -1,61 +1,92 @@
-# phase-0001 — Align help wording and the MITM cache default
+# phase-0001 — Release profile and malloc arena cap
 
 - Status: done
 - Owner: executor
 - Depends on: none
-- Goal: Use `SOCKS4/4a/5` in every help string and default the MITM cert cache to 10240.
-- Done when: `cargo test --locked` passes and the `--help` checks in `## Verify` pass.
-- Pattern to follow: none
+- Goal: Add an optimized `[profile.release]` and cap glibc malloc arenas at 2 on Linux when `MALLOC_ARENA_MAX` is unset, and say so in the sizing guide.
+- Done when: `cargo test --locked` passes, `Cargo.toml` has the exact release profile from sub-task 1, `src/main.rs` matches sub-task 2, and the sizing guide sentence from sub-task 3 is in place.
+- Pattern to follow: `Dockerfile:36-39` (the comment explaining why `MALLOC_ARENA_MAX=2` is set; reuse its reasoning in the code comment)
 
 ## Context
-rusty-conduit is the family's reference for flag names and help text; only two things differ from the agreed contract. The tool supports SOCKS4a, but several help strings say `SOCKS4/5`. The user decided the MITM cache default is 10240 in all three tools (was 10000).
-Only text and one default change in this phase; no flag names, env vars, or behaviour change.
+Release builds currently use Cargo defaults (`lto = false`, `codegen-units = 16`, no strip), so nothing is inlined across the `rusty-conduit-engine` crate boundary. The planner chose `lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`; do not pick other values.
+glibc gives every worker thread its own malloc arena; on many-core Linux that costs ~220 KB per open tunnel instead of ~26 KB. Only the Docker image sets `MALLOC_ARENA_MAX=2` today. glibc reads `MALLOC_ARENA_MAX` itself at startup, so when the variable is set the binary must leave it alone.
+`libc` is already a `[target.'cfg(unix)'.dependencies]` entry in `Cargo.toml`, and the bin target can use it. `libc::mallopt` and `libc::M_ARENA_MAX` exist only for `target_os = "linux"` + `target_env = "gnu"`; that code is not compiled on macOS, so the planner checks it in a Linux container afterwards.
 
 ## Scope
-- In: `src/config.rs`, `tests/socks_proxy.rs` (formatting by `cargo fmt` only, sub-task 4)
-- Out: `src/lib.rs`, every other file under `tests/`, `docs/`, `README.md`, `DOX.md`
+- In: `Cargo.toml`, `src/main.rs`, `docs/PERFORMANCE-AND-SIZING.md`
+- Out: `src/lib.rs`, `Dockerfile` (keep its `ENV MALLOC_ARENA_MAX=2`), `Cargo.lock`, `.github/`, every other doc
 
 ## Sub-tasks
-1. [done] Replace `SOCKS4/5` with `SOCKS4/4a/5` at `src/config.rs:33`, `:107`, `:203`, `:234`, and `:305` (check with `grep -n 'SOCKS4/5' src/config.rs`) — done when: `grep -c 'SOCKS4/5' src/config.rs` prints `0`.
-2. [done] Set `DEFAULT_MITM_CERT_CACHE_MAX_ENTRIES` (`src/config.rs:46`) to `10_240`; change `[default: 10000]` to `[default: 10240]` in the `--mitm-cert-cache-max-entries` doc comment (`src/config.rs:195`); in the unit test at `src/config.rs:1337-1340` change `10_000` to `10_240` and `mitm_cert_cache_max_entries=10000` to `mitm_cert_cache_max_entries=10240` — done when: `grep -nE '10_000|10000' src/config.rs` prints nothing.
-3. [done] Stale comments: the `Config` field doc comments at `src/config.rs:375` and `:377` say the lists are mutually exclusive, but they combine as block-with-exceptions (`HostFilter::from_lists`). Change them to exactly `/// Destination allowlist rules (exceptions to \`block\` when both are set).` and `/// Destination blocklist rules (combine with \`allow\` to carve out exceptions).` — done when: `grep -n 'mutually exclusive' src/config.rs` prints nothing.
-4. [done] Planner answer to the escalation: `tests/socks_proxy.rs` is unchanged since the baseline but fails `cargo fmt --check` with the current stable rustfmt (1.11.0), so `main` already fails CI formatting. Run `cargo fmt` and keep only its changes to `tests/socks_proxy.rs` (the two hunks near lines 654 and 666); make no other edit to that file — done when: `cargo fmt --check` exits 0 and `git diff --stat -- tests/` lists only `tests/socks_proxy.rs`.
+1. [done] Append this block at the very end of `Cargo.toml`, after a blank line, exactly: (block 1 below) — done when: `grep -c '^\[profile.release\]' Cargo.toml` prints `1` and `cargo build --locked` succeeds.
+   Block 1:
+   ```toml
+   # Thin LTO with one codegen unit inlines across the rusty-conduit-engine crate boundary;
+   # stripped symbols keep the release binary and image small.
+   [profile.release]
+   lto = "thin"
+   codegen-units = 1
+   strip = "symbols"
+   ```
+2. [done] Replace the whole of `src/main.rs` with exactly: (block 1 below) — done when: `cargo build --locked` succeeds and `grep -c 'libc::mallopt(libc::M_ARENA_MAX, 2)' src/main.rs` prints `1`.
+   Block 1:
+   ```rust
+   use std::process::ExitCode;
+
+   fn main() -> ExitCode {
+       cap_malloc_arenas();
+       rusty_conduit::main_entry()
+   }
+
+   /// glibc gives every worker thread its own malloc arena, which multiplies memory on hosts with
+   /// many CPUs (about 8x per open connection); two arenas keep it low with no measurable
+   /// throughput cost. glibc applies an explicit `MALLOC_ARENA_MAX` itself, so that one wins.
+   #[cfg(all(target_os = "linux", target_env = "gnu"))]
+   fn cap_malloc_arenas() {
+       if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+           // SAFETY: runs first in `main`, before any other thread exists; `mallopt` takes
+           // integer arguments and touches no Rust-managed memory.
+           unsafe {
+               libc::mallopt(libc::M_ARENA_MAX, 2);
+           }
+       }
+   }
+
+   #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+   fn cap_malloc_arenas() {}
+   ```
+3. [done] In `docs/PERFORMANCE-AND-SIZING.md`, replace exactly this text: `The container image sets `MALLOC_ARENA_MAX=2`. For the prebuilt Linux binaries, set it in the environment (for example `Environment=MALLOC_ARENA_MAX=2` in a `systemd` unit) to get the low figures on any CPU count.` with exactly: `On Linux, the binary caps glibc at two arenas itself when `MALLOC_ARENA_MAX` is not set, so the prebuilt binaries and the container image (which also sets `MALLOC_ARENA_MAX=2`) get the low figures on any CPU count. Set `MALLOC_ARENA_MAX` to another value to override it.` Change nothing else in the file — done when: `grep -c 'caps glibc at two arenas itself' docs/PERFORMANCE-AND-SIZING.md` prints `1` and `grep -c 'For the prebuilt Linux binaries, set it' docs/PERFORMANCE-AND-SIZING.md` prints `0`.
 
 ## Verify
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
-cargo run -q -- --help | grep -F '[default: 10240]'
-! cargo run -q -- --help | grep -F 'SOCKS4/5'
-! grep -n 'mutually exclusive' src/config.rs
+grep -c '^\[profile.release\]' Cargo.toml
+grep -c 'caps glibc at two arenas itself' docs/PERFORMANCE-AND-SIZING.md
+git diff --exit-code -- Cargo.lock src/lib.rs Dockerfile
 ```
+- manual (planner only, needs Docker): `docker run --rm -v "$PWD":/src -w /src rust:1-bookworm cargo clippy --bins --locked -- -D warnings` exits 0, which compiles the Linux-only branch.
 
 ## Escalate when
-- A test outside `src/config.rs` asserts `SOCKS4/5` or `10000` → stop, set Status: needs-human — reason: name the test and the assertion.
-- `grep -n 'SOCKS4/5' src/config.rs` finds lines other than the five listed → change them too and note them in `## Log`; stop only if one is inside a string that a test compares against.
+- `cargo build --locked` fails because `Cargo.lock` would change → stop, set Status: needs-human — reason: paste the error (no new dependency should be needed).
+- The sentence in sub-task 3 is not found verbatim → stop, set Status: needs-human — reason: paste the paragraph under "Memory on many-core Linux" as it is now.
+- clippy reports a lint on the new code → stop, set Status: needs-human — reason: paste the lint; do not add `#[allow]`.
 
 ## Log
 - (append-only, one line per event)
-- planner amended before execution: added sub-task 3 (stale "mutually exclusive" comments found while reviewing rusty-conduit-ssh)
-- sub-task 1: replaced `SOCKS4/5` with `SOCKS4/4a/5` at `src/config.rs:33`, `:107`, `:203`, `:234`, and `:305`
-- sub-task 2: updated `DEFAULT_MITM_CERT_CACHE_MAX_ENTRIES` (`src/config.rs:46`), help doc comment (`src/config.rs:195`), and `caps_defaults` unit test (`src/config.rs:1337-1340`) to `10_240` / `10240`
-- sub-task 3: updated `Config::allow` and `Config::block` doc comments at `src/config.rs:375` and `:377`
-- verify: `cargo fmt --check` failed on pre-existing diffs in `tests/socks_proxy.rs:654` and `:666` (`tests/` is `Scope: Out`); all other verify checks passed; escalating to planner
-
-- planner answered the escalation: format tests/socks_proxy.rs here (pre-existing rustfmt drift, file unchanged since baseline 344ad3b); scope widened to that file for cargo fmt only; added sub-task 4
-- sub-task 4: ran `cargo fmt`, formatting only `tests/socks_proxy.rs` (two hunks near lines 654 and 666); re-ran full `## Verify` and all checks passed
+- sub-task 1: appended `[profile.release]` (`lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`) to `Cargo.toml`
+- sub-task 2: replaced `src/main.rs` to call `cap_malloc_arenas()` using `libc::mallopt(libc::M_ARENA_MAX, 2)` on Linux glibc when `MALLOC_ARENA_MAX` is unset
+- sub-task 3: updated the `MALLOC_ARENA_MAX` sentence in `docs/PERFORMANCE-AND-SIZING.md`
+- phase-0001 verified and closed (manual Docker Linux clippy check remains for planner)
+- planner accepted phase-0001: re-ran ## Verify (104 passed), read the close-commit diff (in scope, matches the plan verbatim), ran the manual Linux clippy check
 
 ## Evidence
 - (append-only: command → observed result)
-- `grep -c 'SOCKS4/5' src/config.rs` → `0`
-- `grep -nE '10_000|10000' src/config.rs` → no output (exit 1)
-- `! grep -n 'mutually exclusive' src/config.rs` → exit 0 (no matches)
-- `cargo fmt --check` → exit 1; formatting diffs in `tests/socks_proxy.rs:654` and `tests/socks_proxy.rs:666` (pre-existing, `Scope: Out`)
-- `rustfmt --check src/config.rs` → exit 0
-- `cargo clippy --all-targets --locked -- -D warnings` → exit 0
-- `cargo test --locked` → exit 0 (38 unit tests + 33 integration tests passed, 0 failed)
-- `cargo run -q -- --help | grep -F '[default: 10240]'` → exit 0 (`Maximum cached MITM leaf certificates; expired then oldest entries are evicted, 0 = unlimited [default: 10240]`)
-- `! cargo run -q -- --help | grep -F 'SOCKS4/5'` → exit 0
-- `cargo fmt && git diff --stat -- tests/` → `tests/socks_proxy.rs | 8 +++-----` (only file changed)
-- `cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked && cargo run -q -- --help | grep -F '[default: 10240]' && ! cargo run -q -- --help | grep -F 'SOCKS4/5' && ! grep -n 'mutually exclusive' src/config.rs` → exit 0 (38 unit tests + 33 integration tests passed, 0 failed)
+- `grep -c '^\[profile.release\]' Cargo.toml && cargo build --locked` → `1` and `Finished dev profile [unoptimized + debuginfo] target(s) in 0.23s` (exit 0)
+- `cargo build --locked && grep -c 'libc::mallopt(libc::M_ARENA_MAX, 2)' src/main.rs` → `Finished dev profile [unoptimized + debuginfo] target(s) in 0.71s` and `1` (exit 0)
+- `grep -c 'caps glibc at two arenas itself' docs/PERFORMANCE-AND-SIZING.md` → `1`; `grep -c 'For the prebuilt Linux binaries, set it' docs/PERFORMANCE-AND-SIZING.md` → `0`
+- `cargo fmt --check` → exit 0 (no output)
+- `cargo clippy --all-targets --locked -- -D warnings` → exit 0 (`Finished dev profile`)
+- `cargo test --locked` → exit 0 (62 unit + 3 cli_contract + 3 filter_proxy + 7 http_proxy + 5 mitm_proxy + 9 mux_port + 9 socks_proxy + 6 validate_cmd = 104 passed, 0 failed)
+- `grep -c '^\[profile.release\]' Cargo.toml` → `1`; `grep -c 'caps glibc at two arenas itself' docs/PERFORMANCE-AND-SIZING.md` → `1`; `git diff --exit-code -- Cargo.lock src/lib.rs Dockerfile` → exit 0
+- planner (claude-opus-5-5): `docker run --rm -v <workspace>:/ws -w /ws/rusty-conduit rust:1-bookworm sh -c 'rustup component add clippy && cargo clippy --bins --locked -- -D warnings'` → exit 0 (Linux glibc branch compiles clean; the image needs the clippy component added)

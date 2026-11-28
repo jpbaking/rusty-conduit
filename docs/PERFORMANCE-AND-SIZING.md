@@ -46,7 +46,7 @@ On Linux, the prebuilt binaries and the container image use glibc's `malloc`, wh
 | glibc defaults, 18 CPUs | ~42 MB | ~220 KB |
 | `MALLOC_ARENA_MAX=2`, 2 or 18 CPUs | ~7 MB | ~26 KB |
 
-The container image sets `MALLOC_ARENA_MAX=2`. For the prebuilt Linux binaries, set it in the environment (for example `Environment=MALLOC_ARENA_MAX=2` in a `systemd` unit) to get the low figures on any CPU count. In the same setup, 64 parallel bulk transfers ran at 2.2–2.7 GB/s with or without it, within run-to-run noise. Fewer worker threads also lower the idle figure: the runtime starts one per CPU it may use, so a Docker `--cpus` limit or `TOKIO_WORKER_THREADS=<n>` reduces them. On macOS, the idle process measured ~8 MB with 18 CPUs.
+On Linux, the binary caps glibc at two arenas itself when `MALLOC_ARENA_MAX` is not set, so the prebuilt binaries and the container image (which also sets `MALLOC_ARENA_MAX=2`) get the low figures on any CPU count. Set `MALLOC_ARENA_MAX` to another value to override it. In the same setup, 64 parallel bulk transfers ran at 2.2–2.7 GB/s with or without it, within run-to-run noise. Fewer worker threads also lower the idle figure: the runtime starts one per CPU it may use, so a Docker `--cpus` limit or `TOKIO_WORKER_THREADS=<n>` reduces them. On macOS, the idle process measured ~8 MB with 18 CPUs.
 
 ---
 

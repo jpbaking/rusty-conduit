@@ -53,3 +53,10 @@ serde_json = "1"
 time = { version = "0.3", features = ["formatting", "macros"] }
 # `all` exposes the keepalive getters used to verify socket options in tests.
 socket2 = { version = "0.6", features = ["all"] }
+
+# Thin LTO with one codegen unit inlines across the rusty-conduit-engine crate boundary;
+# stripped symbols keep the release binary and image small.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
